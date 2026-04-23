@@ -1,5 +1,5 @@
 import nodemailer from "nodemailer";
-import { formatPriceCents, formatPct } from "./format";
+import { formatPriceCents } from "./format";
 import { airportLabel } from "./airports";
 
 type DealEmailPayload = {

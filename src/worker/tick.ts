@@ -90,7 +90,7 @@ export async function runTick() {
           dealsNew++;
           await notifyTrackers(route.id, res.id);
         }
-      } catch (e) {
+      } catch {
         errors++;
       }
     }

@@ -6,6 +6,7 @@ import { Badge } from "@/components/ui/badge";
 import { Sparkline } from "@/components/sparkline";
 import { ArrowLeft, ArrowRight, ExternalLink, Sparkles, Twitter, TrendingDown, Target } from "lucide-react";
 import Link from "next/link";
+import type { Deal } from "@prisma/client";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -20,7 +21,7 @@ export default async function DealDetail({
   if (!deal) return notFound();
 
   let samples: { priceCents: number; sampledAt: Date }[] = [];
-  let related: typeof deal[] = [];
+  let related: Deal[] = [];
   if (deal.routeId) {
     const since = new Date(Date.now() - 30 * 86_400_000);
     samples = await prisma.priceSample.findMany({

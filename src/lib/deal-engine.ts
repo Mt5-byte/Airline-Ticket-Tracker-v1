@@ -198,7 +198,7 @@ export async function persistDeal(d: ScoredDeal): Promise<{ created: boolean; id
       },
     });
     return { created: true, id: row.id };
-  } catch (e) {
+  } catch {
     // Unique-constraint collision under race — treat as no-op.
     return null;
   }

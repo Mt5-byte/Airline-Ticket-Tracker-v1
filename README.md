@@ -169,3 +169,7 @@ Actions, etc.).
   curated RSS feeds still cover most public mistake-fare chatter.
 - **ToS.** Duffel and Amadeus are legit commercial APIs; scraping airline sites
   directly is not wired up on purpose.
+- **Standalone server + `.env`.** Next.js's standalone server (`node server.js`)
+  does not auto-load `.env` at runtime. For `npm run start` / Docker / Fly /
+  Railway, pass env vars directly (Fly secrets, Railway variables, or
+  `docker compose` `env_file`) — not via a local `.env`.

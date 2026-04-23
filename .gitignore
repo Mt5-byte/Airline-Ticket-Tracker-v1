@@ -17,6 +17,7 @@ yarn-error.log*
 
 coverage
 .nyc_output
+*.tsbuildinfo
 
 .vercel
 .fly

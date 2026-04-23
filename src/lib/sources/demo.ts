@@ -32,18 +32,20 @@ function baselineCentsFor(origin: string, destination: string): number {
 export function generateDemoQuote(origin: string, destination: string): PriceQuote {
   const base = baselineCentsFor(origin, destination);
   const now = Date.now();
-  // Minute-scale wobble (sinusoidal) + rare deep drops.
-  const t = now / 60_000;
   const seed = hash(`${origin}${destination}`);
   const phase = (seed % 1000) / 1000;
-  const wobble = Math.sin((t / 30) + phase * Math.PI * 2) * 0.06; // ±6%
-  const noise = ((hash(`${seed}-${Math.floor(t)}`) % 200) - 100) / 1000; // ±10%
+
+  // Smooth 30-minute wobble (±6%) + per-second noise (±8%) so that rapid-fire
+  // polling and real-time polling both produce a realistic time series.
+  const tSec = now / 1000;
+  const wobble = Math.sin(tSec / 1800 + phase * Math.PI * 2) * 0.06;
+  const noise = ((hash(`${seed}-${Math.floor(tSec)}`) % 200) - 100) / 1250;
   let price = base * (1 + wobble + noise);
 
-  // ~3% chance per minute of a mistake fare (−35% to −55%).
-  const roll = hash(`${seed}-dip-${Math.floor(t)}`) % 1000;
-  if (roll < 30) {
-    const drop = 0.35 + ((roll / 30) * 0.2);
+  // ~5% chance per tick of a mistake fare (−35% to −55% off baseline).
+  const roll = hash(`${seed}-dip-${Math.floor(tSec)}`) % 1000;
+  if (roll < 50) {
+    const drop = 0.35 + ((roll / 50) * 0.2);
     price = base * (1 - drop);
   }
 
