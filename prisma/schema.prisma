@@ -1,0 +1,163 @@
+// Skybird — airline price + deal tracker
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─────────────── Auth.js (NextAuth) ───────────────
+model User {
+  id            String         @id @default(cuid())
+  name          String?
+  email         String         @unique
+  emailVerified DateTime?
+  image         String?
+  createdAt     DateTime       @default(now())
+  accounts      Account[]
+  sessions      Session[]
+  tracked       TrackedRoute[]
+  alerts        Alert[]
+}
+
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String? @db.Text
+  session_state     String?
+  user              User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+}
+
+// ─────────────── Domain ───────────────
+model Route {
+  id          String         @id @default(cuid())
+  origin      String // IATA (3 letters)
+  destination String // IATA (3 letters)
+  isCurated   Boolean        @default(false)
+  createdAt   DateTime       @default(now())
+  prices      PriceSample[]
+  deals       Deal[]
+  trackers    TrackedRoute[]
+
+  @@unique([origin, destination])
+  @@index([isCurated])
+}
+
+model PriceSample {
+  id         String    @id @default(cuid())
+  routeId    String
+  route      Route     @relation(fields: [routeId], references: [id], onDelete: Cascade)
+  priceCents Int
+  currency   String    @default("USD")
+  cabin      String    @default("economy")
+  carrier    String?
+  source     String // "duffel" | "amadeus" | "demo"
+  departAt   DateTime?
+  returnAt   DateTime?
+  deepLink   String?
+  sampledAt  DateTime  @default(now())
+
+  @@index([routeId, sampledAt])
+  @@index([sampledAt])
+}
+
+model Deal {
+  id              String    @id @default(cuid())
+  routeId         String?
+  route           Route?    @relation(fields: [routeId], references: [id], onDelete: SetNull)
+  originCode      String
+  destinationCode String
+  originName      String?
+  destinationName String?
+  priceCents      Int?
+  currency        String    @default("USD")
+  baselineCents   Int?
+  discountPct     Float?
+  cabin           String    @default("economy")
+  carrier         String?
+  departAt        DateTime?
+  returnAt        DateTime?
+  source          String // "baseline" | "curated" | "user-target" | "twitter"
+  sourceLabel     String?
+  sourceUrl       String?
+  headline        String?
+  body            String?   @db.Text
+  score           Float     @default(0)
+  seenAt          DateTime  @default(now())
+  expiresAt       DateTime?
+  dedupeKey       String    @unique
+  alerts          Alert[]
+
+  @@index([seenAt])
+  @@index([score])
+  @@index([source])
+  @@index([originCode, destinationCode])
+}
+
+model TrackedRoute {
+  id            String   @id @default(cuid())
+  userId        String
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  routeId       String
+  route         Route    @relation(fields: [routeId], references: [id], onDelete: Cascade)
+  targetCents   Int?
+  targetDropPct Float?
+  notifyEmail   Boolean  @default(true)
+  createdAt     DateTime @default(now())
+
+  @@unique([userId, routeId])
+  @@index([userId])
+}
+
+model Alert {
+  id      String   @id @default(cuid())
+  userId  String
+  user    User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  dealId  String
+  deal    Deal     @relation(fields: [dealId], references: [id], onDelete: Cascade)
+  channel String   @default("email")
+  sentAt  DateTime @default(now())
+
+  @@unique([userId, dealId])
+  @@index([userId])
+}
+
+model WorkerRun {
+  id        String   @id @default(cuid())
+  startedAt DateTime @default(now())
+  endedAt   DateTime?
+  sampled   Int      @default(0)
+  dealsNew  Int      @default(0)
+  errors    Int      @default(0)
+  note      String?
+
+  @@index([startedAt])
+}

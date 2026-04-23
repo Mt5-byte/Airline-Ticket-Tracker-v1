@@ -1,0 +1,51 @@
+# fly.toml — deploy with: fly launch --copy-config --no-deploy, then fly deploy
+app = "skybird"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  NODE_ENV = "production"
+  PORT = "3000"
+  WORKER_MODE = "standalone"
+
+[experimental]
+  # Two independent processes: the Next.js server and the per-minute worker.
+  # Scale each independently: `fly scale count web=1 worker=1`
+  auto_rollback = true
+
+[processes]
+  web = "node server.js"
+  worker = "npx tsx src/worker/index.ts"
+
+[http_service]
+  internal_port = 3000
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ["web"]
+
+  [[http_service.checks]]
+    grace_period = "10s"
+    interval = "30s"
+    method = "GET"
+    path = "/api/health"
+    protocol = "http"
+    timeout = "5s"
+
+[[vm]]
+  memory = "512mb"
+  cpu_kind = "shared"
+  cpus = 1
+  processes = ["web"]
+
+[[vm]]
+  memory = "512mb"
+  cpu_kind = "shared"
+  cpus = 1
+  processes = ["worker"]
+
+[deploy]
+  release_command = "npx prisma db push --accept-data-loss --skip-generate"
