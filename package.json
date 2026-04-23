@@ -11,8 +11,7 @@
     "worker:once": "tsx src/worker/once.ts",
     "seed": "tsx prisma/seed.ts",
     "prisma:migrate": "prisma migrate deploy",
-    "prisma:generate": "prisma generate",
-    "postinstall": "prisma generate"
+    "prisma:generate": "prisma generate"
   },
   "dependencies": {
     "@auth/prisma-adapter": "^1.6.0",
