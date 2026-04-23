@@ -1,0 +1,22 @@
+# Used only if Railway's builder is set to "NIXPACKS" (their default for Node
+# projects). Mirrors the Dockerfile so either path produces a working web
+# service. The separate worker service should override `start.cmd` in Railway's
+# service settings to `npx tsx src/worker/index.ts`.
+
+[phases.setup]
+aptPkgs = ["openssl", "ca-certificates"]
+
+[phases.install]
+cmds = ["npm ci"]
+
+[phases.build]
+cmds = [
+  "npx prisma generate",
+  "npm run build",
+  # standalone output needs .next/static and public/ alongside server.js
+  "cp -r .next/static .next/standalone/.next/static",
+  "cp -r public .next/standalone/public"
+]
+
+[start]
+cmd = "node .next/standalone/server.js"

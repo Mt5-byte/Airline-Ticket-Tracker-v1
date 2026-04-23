@@ -131,6 +131,18 @@ then **two** services from the same repo:
 
 Set the same env vars as above. Done.
 
+**Gotchas:**
+- After creating each service, open **Settings → Build** and confirm
+  **Builder = Dockerfile** (Railway's default is Nixpacks; the repo's
+  `railway.json` requests Dockerfile but the dashboard setting wins). If you
+  want to stay on Nixpacks, a fallback `nixpacks.toml` is included — it mirrors
+  the Dockerfile build.
+- The worker service must override its **Start Command** to
+  `npx tsx src/worker/index.ts` (the default start command comes from the
+  Dockerfile's `CMD`, which is the web server).
+- Set `NEXTAUTH_URL` and `APP_URL` to the public Railway URL **after** the
+  first deploy gives you one, then redeploy once.
+
 ### Docker Compose (self-host)
 
 ```bash

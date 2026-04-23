@@ -1,4 +1,5 @@
-# syntax=docker/dockerfile:1.7
+# Multi-stage Dockerfile. Works with plain `docker build` (no BuildKit required)
+# and with Fly.io / Railway remote builders.
 
 ARG NODE_VERSION=20.17.0
 
@@ -8,8 +9,7 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends openssl ca-certificates && rm -rf /var/lib/apt/lists/*
 COPY package.json package-lock.json* ./
 COPY prisma ./prisma
-RUN --mount=type=cache,target=/root/.npm \
-    if [ -f package-lock.json ]; then npm ci; else npm install; fi
+RUN if [ -f package-lock.json ]; then npm ci; else npm install; fi
 
 # ───────── build stage ─────────
 FROM node:${NODE_VERSION}-slim AS build
