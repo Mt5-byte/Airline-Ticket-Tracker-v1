@@ -170,38 +170,41 @@ export async function evaluateUserTarget(
 export async function persistDeal(d: ScoredDeal): Promise<{ created: boolean; id: string } | null> {
   const origin = lookupAirport(d.origin);
   const destination = lookupAirport(d.destination);
-  try {
-    const existing = await prisma.deal.findUnique({ where: { dedupeKey: d.dedupeKey } });
-    if (existing) return { created: false, id: existing.id };
-    const row = await prisma.deal.create({
-      data: {
-        routeId: d.routeId,
-        originCode: d.origin,
-        destinationCode: d.destination,
-        originName: origin ? `${origin.city}, ${origin.country}` : airportLabel(d.origin),
-        destinationName: destination ? `${destination.city}, ${destination.country}` : airportLabel(d.destination),
-        priceCents: d.priceCents,
-        baselineCents: d.baselineCents,
-        discountPct: d.discountPct,
-        cabin: d.cabin,
-        carrier: d.carrier,
-        departAt: d.departAt,
-        returnAt: d.returnAt,
-        source: d.source,
-        sourceLabel: d.sourceLabel,
-        sourceUrl: d.sourceUrl,
-        headline: d.headline,
-        body: d.body,
-        score: d.score,
-        dedupeKey: d.dedupeKey,
-        expiresAt: d.expiresAt,
-      },
-    });
-    return { created: true, id: row.id };
-  } catch {
-    // Unique-constraint collision under race — treat as no-op.
-    return null;
-  }
+  // createMany({ skipDuplicates: true }) compiles to an atomic
+  // `INSERT ... ON CONFLICT DO NOTHING` on PostgreSQL. Unlike `upsert`, which
+  // Prisma implements as SELECT-then-INSERT (and therefore can race under
+  // concurrent workers, emitting noisy stderr `prisma:error` lines even when
+  // caught), this is race-free and silent on conflict. The returned `count`
+  // tells us whether we inserted (1) or lost the race (0).
+  const data = {
+    routeId: d.routeId,
+    originCode: d.origin,
+    destinationCode: d.destination,
+    originName: origin ? `${origin.city}, ${origin.country}` : airportLabel(d.origin),
+    destinationName: destination ? `${destination.city}, ${destination.country}` : airportLabel(d.destination),
+    priceCents: d.priceCents,
+    baselineCents: d.baselineCents,
+    discountPct: d.discountPct,
+    cabin: d.cabin,
+    carrier: d.carrier,
+    departAt: d.departAt,
+    returnAt: d.returnAt,
+    source: d.source,
+    sourceLabel: d.sourceLabel,
+    sourceUrl: d.sourceUrl,
+    headline: d.headline,
+    body: d.body,
+    score: d.score,
+    dedupeKey: d.dedupeKey,
+    expiresAt: d.expiresAt,
+  };
+  const result = await prisma.deal.createMany({ data: [data], skipDuplicates: true });
+  const row = await prisma.deal.findUnique({
+    where: { dedupeKey: d.dedupeKey },
+    select: { id: true },
+  });
+  if (!row) return null;
+  return { created: result.count === 1, id: row.id };
 }
 
 function clamp(n: number, lo: number, hi: number) {
