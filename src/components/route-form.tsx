@@ -91,7 +91,15 @@ export function RouteForm({ existing }: { existing: Tracked[] }) {
       });
       if (!res.ok) {
         const j = await res.json().catch(() => ({}));
-        setErr(j.error?.formErrors?.[0] ?? j.error ?? "Failed to add route");
+        // j.error may be a plain string or a zod flatten() object — normalize
+        // to a string, or React throws on rendering an object child.
+        const msg =
+          typeof j.error === "string"
+            ? j.error
+            : j.error?.formErrors?.[0] ??
+              (Object.values(j.error?.fieldErrors ?? {}).flat()[0] as string | undefined) ??
+              "Failed to add route";
+        setErr(String(msg));
         return;
       }
       setOrigin("");

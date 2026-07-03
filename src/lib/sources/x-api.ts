@@ -1,5 +1,6 @@
 import { createHash } from "crypto";
 import type { DealSignal } from "./types";
+import { extractPriceCents, extractRoute } from "./extract";
 
 const DEFAULT_ACCOUNTS = "SecretFlying,TheFlightDeal,airfarewatchdog,going,Scottscheapflt";
 
@@ -7,24 +8,17 @@ type CachedUser = { id: string; username: string };
 let userCache: CachedUser[] | null = null;
 let lastFetch = 0;
 
-function extractRoute(text: string): { origin?: string; destination?: string } {
-  const matches = text.match(/\b[A-Z]{3}\b/g);
-  if (!matches) return {};
-  const bad = new Set(["USA", "USD", "GBP", "EUR", "NYC", "RT", "OW", "NEW", "DEAL", "OFF", "NOW", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC", "JAN", "FEB", "MAR", "APR", "MAY", "JUN"]);
-  const clean = matches.filter((m) => !bad.has(m));
-  return { origin: clean[0], destination: clean[1] };
-}
-
-function extractPriceCents(text: string): number | undefined {
-  const m = text.match(/\$\s?(\d{2,4})/);
-  if (!m) return undefined;
-  return parseInt(m[1], 10) * 100;
-}
-
-async function getUserIds(token: string, usernames: string[]): Promise<CachedUser[]> {
+async function getUserIds(
+  token: string,
+  usernames: string[],
+  signal?: AbortSignal,
+): Promise<CachedUser[]> {
   if (userCache && Date.now() - lastFetch < 24 * 3600 * 1000) return userCache;
+  // Pass the tick's AbortSignal — a stalled api.x.com connection must not be
+  // able to hold the worker past its per-minute budget.
   const res = await fetch(`https://api.x.com/2/users/by?usernames=${usernames.join(",")}`, {
     headers: { Authorization: `Bearer ${token}` },
+    signal,
   });
   if (!res.ok) {
     console.warn(`[x-api] user lookup ${res.status}`);
@@ -50,7 +44,7 @@ export async function fetchXDeals(signal?: AbortSignal): Promise<DealSignal[]> {
     .filter(Boolean);
   if (!accountsEnv.length) return [];
 
-  const users = await getUserIds(token, accountsEnv);
+  const users = await getUserIds(token, accountsEnv, signal);
   if (!users.length) return [];
 
   const out: DealSignal[] = [];

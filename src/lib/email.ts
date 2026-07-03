@@ -16,6 +16,18 @@ type DealEmailPayload = {
 
 let transporterCache: nodemailer.Transporter | null = null;
 
+// Headline/source strings originate from external RSS feeds and tweets —
+// escape everything interpolated into the HTML body or a malicious feed item
+// could inject markup into alert emails.
+function esc(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
 function getTransporter() {
   if (transporterCache) return transporterCache;
   const { EMAIL_SERVER_HOST, EMAIL_SERVER_PORT, EMAIL_SERVER_USER, EMAIL_SERVER_PASSWORD } = process.env;
@@ -37,18 +49,22 @@ export async function sendDealEmail(p: DealEmailPayload) {
     console.warn("[email] SMTP not configured; skipping alert email to", p.to);
     return false;
   }
+  const originLabel = esc(airportLabel(p.origin));
+  const destLabel = esc(airportLabel(p.destination));
+  const safeSourceUrl =
+    p.sourceUrl && /^https?:\/\//i.test(p.sourceUrl) ? p.sourceUrl : null;
   const subject = `✈ Deal: ${airportLabel(p.origin)} → ${airportLabel(p.destination)}${
     p.priceCents ? ` · ${formatPriceCents(p.priceCents)}` : ""
   }`;
   const html = `
     <div style="font-family:Inter,system-ui,sans-serif;max-width:560px;margin:0 auto;padding:24px;color:#0A0A0B;background:#FAFAF9;border-radius:12px;">
       <div style="font-size:12px;letter-spacing:0.08em;text-transform:uppercase;color:#71717A;margin-bottom:8px;">Skybird alert</div>
-      <h1 style="font-size:22px;margin:0 0 8px 0;">${airportLabel(p.origin)} → ${airportLabel(p.destination)}</h1>
-      ${p.priceCents ? `<div style="font-size:40px;font-weight:600;font-family:ui-monospace,monospace;color:#0A0A0B;">${formatPriceCents(p.priceCents)}</div>` : ""}
+      <h1 style="font-size:22px;margin:0 0 8px 0;">${originLabel} → ${destLabel}</h1>
+      ${p.priceCents ? `<div style="font-size:40px;font-weight:600;font-family:ui-monospace,monospace;color:#0A0A0B;">${esc(formatPriceCents(p.priceCents))}</div>` : ""}
       ${p.discountPct ? `<div style="display:inline-block;padding:4px 10px;border-radius:999px;background:#DCFCE7;color:#15803D;font-size:12px;font-weight:600;margin-top:6px;">−${Math.round(p.discountPct)}% vs baseline</div>` : ""}
-      ${p.headline ? `<p style="color:#3F3F46;line-height:1.5;">${p.headline}</p>` : ""}
-      <a href="${p.dealUrl}" style="display:inline-block;margin-top:16px;padding:10px 16px;border-radius:8px;background:#0A0A0B;color:#FAFAF9;text-decoration:none;font-weight:500;">View deal</a>
-      <p style="color:#71717A;font-size:12px;margin-top:24px;">Source: ${p.source}${p.sourceUrl ? ` · <a href="${p.sourceUrl}" style="color:#71717A;">link</a>` : ""}</p>
+      ${p.headline ? `<p style="color:#3F3F46;line-height:1.5;">${esc(p.headline)}</p>` : ""}
+      <a href="${esc(p.dealUrl)}" style="display:inline-block;margin-top:16px;padding:10px 16px;border-radius:8px;background:#0A0A0B;color:#FAFAF9;text-decoration:none;font-weight:500;">View deal</a>
+      <p style="color:#71717A;font-size:12px;margin-top:24px;">Source: ${esc(p.source)}${safeSourceUrl ? ` · <a href="${esc(safeSourceUrl)}" style="color:#71717A;">link</a>` : ""}</p>
     </div>`;
   await t.sendMail({
     from: process.env.EMAIL_FROM ?? "Skybird <alerts@skybird.app>",

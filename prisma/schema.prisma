@@ -93,6 +93,9 @@ model Deal {
   id              String    @id @default(cuid())
   routeId         String?
   route           Route?    @relation(fields: [routeId], references: [id], onDelete: SetNull)
+  // Owner of a private "user-target" deal. Null for public deals; target hits
+  // are only shown to (and only alert) the user whose target fired.
+  userId          String?
   originCode      String
   destinationCode String
   originName      String?
@@ -117,9 +120,11 @@ model Deal {
   alerts          Alert[]
 
   @@index([seenAt])
-  @@index([score])
+  @@index([score(sort: Desc), seenAt(sort: Desc)])
   @@index([source])
+  @@index([userId])
   @@index([originCode, destinationCode])
+  @@index([routeId, source, seenAt])
 }
 
 model TrackedRoute {

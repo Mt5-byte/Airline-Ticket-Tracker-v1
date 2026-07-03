@@ -8,10 +8,17 @@ import { z } from "zod";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
+// Every tracked route becomes per-minute polling work for the worker; cap it
+// so a single account can't inflate the fan-out unboundedly.
+const MAX_TRACKED_ROUTES_PER_USER = 50;
+
 const CreateSchema = z.object({
   origin: z.string().length(3),
   destination: z.string().length(3),
-  targetCents: z.number().int().positive().optional(),
+  // Upper bound keeps values inside Postgres INT4 and inside plausible airfare
+  // territory ($100k) — without it, 3_000_000_000 passes int()+positive() and
+  // crashes Prisma with a 500.
+  targetCents: z.number().int().positive().max(10_000_000).optional(),
   targetDropPct: z.number().min(1).max(90).optional(),
 });
 
@@ -52,11 +59,27 @@ export async function POST(req: Request) {
     create: { origin, destination, isCurated: false },
   });
 
+  const existing = await prisma.trackedRoute.findUnique({
+    where: { userId_routeId: { userId, routeId: route.id } },
+  });
+  if (!existing) {
+    const count = await prisma.trackedRoute.count({ where: { userId } });
+    if (count >= MAX_TRACKED_ROUTES_PER_USER) {
+      return NextResponse.json(
+        { error: `route limit reached (${MAX_TRACKED_ROUTES_PER_USER})` },
+        { status: 400 },
+      );
+    }
+  }
+
   const tracked = await prisma.trackedRoute.upsert({
     where: { userId_routeId: { userId, routeId: route.id } },
+    // Only overwrite targets the caller actually sent — a re-POST without
+    // targets must not silently clear an existing target. (Clearing is done
+    // by removing and re-adding the route.)
     update: {
-      targetCents: parsed.data.targetCents ?? null,
-      targetDropPct: parsed.data.targetDropPct ?? null,
+      ...(parsed.data.targetCents !== undefined ? { targetCents: parsed.data.targetCents } : {}),
+      ...(parsed.data.targetDropPct !== undefined ? { targetDropPct: parsed.data.targetDropPct } : {}),
     },
     create: {
       userId,

@@ -299,7 +299,9 @@ PY
     for needle in "Significantly discounted air travel" "Live deal feed" "polling every 60 seconds"; do
       grep -q "$needle" "$LOG_DIR/home-$i.html" || { echo "    FAIL content: '$needle'"; content_fails=$((content_fails+1)); }
     done
-    n_cards=$(grep -oE 'href="/deals/cmo[a-z0-9]+"' "$LOG_DIR/home-$i.html" | wc -l)
+    # cuid ids embed a timestamp — never hardcode more than the leading "c"
+    # (a "cmo" prefix matched April-2026 ids only and broke months later).
+    n_cards=$(grep -oE 'href="/deals/c[a-z0-9]{20,}"' "$LOG_DIR/home-$i.html" | wc -l)
     [ "$n_cards" -lt 1 ] && { echo "    FAIL no deal cards"; content_fails=$((content_fails+1)); } \
                        || echo "    ok  $n_cards deal cards rendered"
 

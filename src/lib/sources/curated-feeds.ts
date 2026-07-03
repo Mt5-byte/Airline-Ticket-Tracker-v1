@@ -1,6 +1,7 @@
 import { XMLParser } from "fast-xml-parser";
 import { createHash } from "crypto";
 import type { DealSignal } from "./types";
+import { extractPriceCents, extractRoute } from "./extract";
 
 const FEEDS: Array<{ url: string; label: string }> = [
   { url: "https://www.secretflying.com/feed/", label: "Secret Flying" },
@@ -11,29 +12,15 @@ const FEEDS: Array<{ url: string; label: string }> = [
 
 const parser = new XMLParser({ ignoreAttributes: false });
 
-// Light IATA extractor. Pulls the first two distinct 3-letter airport codes from
-// title + description. Good enough for "XYZ -> ABC" and "ATL to LAX" patterns.
-function extractRoute(text: string): { origin?: string; destination?: string } {
-  const matches = text.match(/\b[A-Z]{3}\b/g);
-  if (!matches) return {};
-  const seen: string[] = [];
-  for (const m of matches) {
-    // Filter common English all-caps noise.
-    if (["USA", "USD", "GBP", "EUR", "RT", "OW", "CAD", "NYC", "LAX", "NEW", "DEAL", "OFF", "NOW", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC", "JAN", "FEB", "MAR", "APR", "MAY", "JUN"].includes(m) && seen.length) continue;
-    if (!seen.includes(m)) seen.push(m);
-    if (seen.length === 2) break;
-  }
-  return { origin: seen[0], destination: seen[1] };
-}
-
-function extractPriceCents(text: string): number | undefined {
-  const m = text.match(/\$\s?(\d{2,4})(?:\s?-\s?\$?\d{2,4})?/);
-  if (!m) return undefined;
-  return parseInt(m[1], 10) * 100;
-}
-
 function dedupe(url: string, title: string): string {
   return createHash("sha1").update(`${url}\n${title}`).digest("hex");
+}
+
+// fast-xml-parser returns a bare object (not a 1-element array) when a feed
+// has exactly one <item>; normalize so .slice/.flatMap don't drop the feed.
+function asArray<T>(v: T | T[] | undefined | null): T[] {
+  if (v == null) return [];
+  return Array.isArray(v) ? v : [v];
 }
 
 async function fetchFeed(feed: { url: string; label: string }, signal?: AbortSignal): Promise<DealSignal[]> {
@@ -45,7 +32,7 @@ async function fetchFeed(feed: { url: string; label: string }, signal?: AbortSig
     if (!res.ok) return [];
     const xml = await res.text();
     const parsed = parser.parse(xml);
-    const items: any[] = parsed?.rss?.channel?.item ?? parsed?.feed?.entry ?? [];
+    const items = asArray<any>(parsed?.rss?.channel?.item ?? parsed?.feed?.entry);
     return items.slice(0, 15).flatMap((it): DealSignal[] => {
       const title: string = typeof it.title === "string" ? it.title : it.title?.["#text"] ?? "";
       const link: string = typeof it.link === "string" ? it.link : it.link?.["@_href"] ?? it.link?.["#text"] ?? "";

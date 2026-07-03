@@ -2,6 +2,10 @@ import type { PriceQuote } from "./types";
 
 type TokenCache = { token: string; expiresAt: number } | null;
 let tokenCache: TokenCache = null;
+// In-flight dedup: the first tick fires one quote request per route
+// concurrently; without this, every one of them would kick off its own OAuth
+// token request (thundering herd against the auth endpoint).
+let tokenInFlight: Promise<string | null> | null = null;
 
 function baseUrl() {
   return process.env.AMADEUS_ENV === "production"
@@ -9,11 +13,10 @@ function baseUrl() {
     : "https://test.api.amadeus.com";
 }
 
-async function getToken(signal?: AbortSignal): Promise<string | null> {
+async function requestToken(signal?: AbortSignal): Promise<string | null> {
   const id = process.env.AMADEUS_CLIENT_ID;
   const secret = process.env.AMADEUS_CLIENT_SECRET;
   if (!id || !secret) return null;
-  if (tokenCache && tokenCache.expiresAt > Date.now() + 30_000) return tokenCache.token;
 
   const res = await fetch(`${baseUrl()}/v1/security/oauth2/token`, {
     method: "POST",
@@ -32,6 +35,16 @@ async function getToken(signal?: AbortSignal): Promise<string | null> {
     expiresAt: Date.now() + (json.expires_in ?? 1800) * 1000,
   };
   return tokenCache.token;
+}
+
+async function getToken(signal?: AbortSignal): Promise<string | null> {
+  if (tokenCache && tokenCache.expiresAt > Date.now() + 30_000) return tokenCache.token;
+  if (!tokenInFlight) {
+    tokenInFlight = requestToken(signal).finally(() => {
+      tokenInFlight = null;
+    });
+  }
+  return tokenInFlight;
 }
 
 function daysFromNow(days: number): string {

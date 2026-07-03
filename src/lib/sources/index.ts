@@ -11,12 +11,29 @@ const hasDuffel = () => Boolean(process.env.DUFFEL_ACCESS_TOKEN);
 const hasAmadeus = () =>
   Boolean(process.env.AMADEUS_CLIENT_ID && process.env.AMADEUS_CLIENT_SECRET);
 
+/** True when at least one real fare provider is configured. */
+export function hasRealProvider(): boolean {
+  return hasDuffel() || hasAmadeus();
+}
+
+/**
+ * Fetch the current cheapest fare for a route.
+ *
+ * When a real provider is configured, a provider failure returns null — the
+ * caller skips that sample. It must NOT silently fall back to the demo
+ * generator: demo prices come from a different distribution, so one bad
+ * minute at the provider would poison the route's real 30-day baseline and
+ * mint bogus "discount" deals. Demo data is used only when no provider is
+ * configured at all.
+ */
 export async function fetchPriceQuote(
   origin: string,
   destination: string,
   signal?: AbortSignal,
-): Promise<PriceQuote> {
-  // Try real providers in order. First hit wins; otherwise fall back to demo.
+): Promise<PriceQuote | null> {
+  if (!hasRealProvider()) {
+    return generateDemoQuote(origin, destination);
+  }
   if (hasDuffel()) {
     const q = await fetchDuffelQuote(origin, destination, signal).catch(() => null);
     if (q) return q;
@@ -25,7 +42,7 @@ export async function fetchPriceQuote(
     const q = await fetchAmadeusQuote(origin, destination, signal).catch(() => null);
     if (q) return q;
   }
-  return generateDemoQuote(origin, destination);
+  return null;
 }
 
 export async function fetchDealSignals(signal?: AbortSignal): Promise<DealSignal[]> {
@@ -47,6 +64,6 @@ export function sourcesStatus() {
     duffel: hasDuffel(),
     amadeus: hasAmadeus(),
     twitter: Boolean(process.env.X_BEARER_TOKEN),
-    demoMode: !hasDuffel() && !hasAmadeus(),
+    demoMode: !hasRealProvider(),
   };
 }

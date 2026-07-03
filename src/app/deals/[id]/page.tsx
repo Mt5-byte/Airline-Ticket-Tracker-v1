@@ -1,4 +1,6 @@
+import { getServerSession } from "next-auth";
 import { prisma } from "@/lib/db";
+import { authOptions } from "@/lib/auth";
 import { notFound } from "next/navigation";
 import { airportLabel, lookupAirport } from "@/lib/airports";
 import { formatPriceCents, timeAgo, formatDateRange } from "@/lib/format";
@@ -11,6 +13,10 @@ import type { Deal } from "@prisma/client";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
+function isSafeUrl(url: string | null): url is string {
+  return Boolean(url && /^https?:\/\//i.test(url));
+}
+
 export default async function DealDetail({
   params,
 }: {
@@ -20,17 +26,31 @@ export default async function DealDetail({
   const deal = await prisma.deal.findUnique({ where: { id }, include: { route: true } });
   if (!deal) return notFound();
 
-  let samples: { priceCents: number; sampledAt: Date }[] = [];
+  const session = await getServerSession(authOptions);
+  const userId = (session?.user as { id?: string } | undefined)?.id;
+  // Private user-target deals exist only for their owner.
+  if (deal.userId && deal.userId !== userId) return notFound();
+
+  let history: number[] = [];
   let related: Deal[] = [];
   if (deal.routeId) {
     const since = new Date(Date.now() - 30 * 86_400_000);
-    samples = await prisma.priceSample.findMany({
-      where: { routeId: deal.routeId, sampledAt: { gte: since } },
-      orderBy: { sampledAt: "asc" },
-      select: { priceCents: true, sampledAt: true },
-    });
+    // Hourly-averaged in SQL — a 30-day window of raw per-minute samples is
+    // ~43k rows and must not be loaded into the page render.
+    const rows = await prisma.$queryRaw<Array<{ h: Date; p: number }>>`
+      SELECT date_trunc('hour', "sampledAt") AS h, AVG("priceCents")::float AS p
+      FROM "PriceSample"
+      WHERE "routeId" = ${deal.routeId} AND "sampledAt" >= ${since}
+      GROUP BY 1
+      ORDER BY 1 ASC
+    `;
+    history = rows.map((r) => r.p);
     related = await prisma.deal.findMany({
-      where: { routeId: deal.routeId, id: { not: deal.id } },
+      where: {
+        routeId: deal.routeId,
+        id: { not: deal.id },
+        OR: [{ userId: null }, ...(userId ? [{ userId }] : [])],
+      },
       orderBy: { seenAt: "desc" },
       take: 4,
     });
@@ -96,7 +116,7 @@ export default async function DealDetail({
               )}
             </div>
 
-            {deal.sourceUrl && (
+            {isSafeUrl(deal.sourceUrl) && (
               <a
                 href={deal.sourceUrl}
                 target="_blank"
@@ -118,13 +138,13 @@ export default async function DealDetail({
                 Baseline: <span className="num line-through">{formatPriceCents(deal.baselineCents, deal.currency)}</span>
               </div>
             )}
-            {samples.length > 1 && (
+            {history.length > 1 && (
               <div className="mt-6">
                 <div className="text-[10px] uppercase tracking-widest text-muted-foreground mb-2">
                   Last 30 days
                 </div>
                 <Sparkline
-                  values={samples.map((s) => s.priceCents)}
+                  values={history}
                   width={260}
                   height={80}
                   stroke="hsl(var(--primary))"

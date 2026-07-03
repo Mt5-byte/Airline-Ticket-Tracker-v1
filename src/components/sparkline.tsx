@@ -1,5 +1,19 @@
 import { cn } from "@/lib/utils";
 
+// Deterministic per-instance gradient id. A fixed id ("spark-fade") collides
+// when multiple sparklines render on one page — browsers resolve every
+// url(#id) against the FIRST definition, so all area fills inherit the first
+// sparkline's stroke color.
+function gradientId(values: number[], stroke: string): string {
+  let h = 2166136261;
+  const s = `${stroke}|${values.join(",")}`;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return `spark-${(h >>> 0).toString(36)}`;
+}
+
 /** Pure-SVG price sparkline. No deps. Normalizes values to [0,1]. */
 export function Sparkline({
   values,
@@ -34,6 +48,7 @@ export function Sparkline({
   });
   const pathD = `M${pts.join(" L")}`;
   const areaD = `${pathD} L${width},${height} L0,${height} Z`;
+  const gid = gradientId(values, stroke);
 
   return (
     <svg
@@ -43,12 +58,12 @@ export function Sparkline({
       className={cn("overflow-visible", className)}
     >
       <defs>
-        <linearGradient id="spark-fade" x1="0" y1="0" x2="0" y2="1">
+        <linearGradient id={gid} x1="0" y1="0" x2="0" y2="1">
           <stop offset="0%" stopColor={stroke} stopOpacity="0.2" />
           <stop offset="100%" stopColor={stroke} stopOpacity="0" />
         </linearGradient>
       </defs>
-      <path d={areaD} fill="url(#spark-fade)" stroke="none" />
+      <path d={areaD} fill={`url(#${gid})`} stroke="none" />
       <path d={pathD} stroke={stroke} strokeWidth="1.5" fill={fill} strokeLinecap="round" strokeLinejoin="round" />
     </svg>
   );

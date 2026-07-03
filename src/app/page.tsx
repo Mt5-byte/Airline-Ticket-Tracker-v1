@@ -1,4 +1,7 @@
+import { Prisma } from "@prisma/client";
+import { getServerSession } from "next-auth";
 import { prisma } from "@/lib/db";
+import { authOptions } from "@/lib/auth";
 import { DealCard } from "@/components/deal-card";
 import { FilterBar } from "@/components/filter-bar";
 import { EmptyState } from "@/components/empty-state";
@@ -10,12 +13,24 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 export const revalidate = 0;
 
-type SearchParams = Promise<{ source?: string }>;
+const SOURCES = new Set(["baseline", "curated", "twitter", "user-target"]);
+
+type SearchParams = Promise<{ source?: string | string[] }>;
 
 export default async function HomePage({ searchParams }: { searchParams: SearchParams }) {
-  const { source } = await searchParams;
+  const { source: sourceParam } = await searchParams;
+  // Duplicate ?source= params arrive as an array — never hand Prisma a non-string.
+  const sourceRaw = Array.isArray(sourceParam) ? sourceParam[0] : sourceParam;
+  const source = sourceRaw && SOURCES.has(sourceRaw) ? sourceRaw : undefined;
 
-  const where: any = { score: { gte: 50 } };
+  const session = await getServerSession(authOptions);
+  const userId = (session?.user as { id?: string } | undefined)?.id;
+
+  const where: any = {
+    score: { gte: 50 },
+    // Private user-target deals appear only in their owner's feed.
+    OR: [{ userId: null }, ...(userId ? [{ userId }] : [])],
+  };
   if (source) where.source = source;
 
   const [deals, totalRoutes, totalDeals, lastRun] = await Promise.all([
@@ -29,20 +44,23 @@ export default async function HomePage({ searchParams }: { searchParams: SearchP
     prisma.workerRun.findFirst({ orderBy: { startedAt: "desc" } }),
   ]);
 
-  // Pull small price histories for baseline-type deals so cards can show sparklines.
+  // Sparkline history: hourly-averaged in SQL. Raw per-minute rows would be
+  // ~20k rows per route per 14 days — never ship that to a page render.
   const routeIds = Array.from(
     new Set(deals.filter((d) => d.routeId && d.source === "baseline").map((d) => d.routeId!)),
   );
   const historyByRoute: Record<string, number[]> = {};
   if (routeIds.length) {
     const since = new Date(Date.now() - 14 * 86_400_000);
-    const samples = await prisma.priceSample.findMany({
-      where: { routeId: { in: routeIds }, sampledAt: { gte: since } },
-      orderBy: { sampledAt: "asc" },
-      select: { routeId: true, priceCents: true },
-    });
-    for (const s of samples) {
-      (historyByRoute[s.routeId] ??= []).push(s.priceCents);
+    const rows = await prisma.$queryRaw<Array<{ routeId: string; h: Date; p: number }>>`
+      SELECT "routeId", date_trunc('hour', "sampledAt") AS h, AVG("priceCents")::float AS p
+      FROM "PriceSample"
+      WHERE "routeId" IN (${Prisma.join(routeIds)}) AND "sampledAt" >= ${since}
+      GROUP BY 1, 2
+      ORDER BY 2 ASC
+    `;
+    for (const r of rows) {
+      (historyByRoute[r.routeId] ??= []).push(r.p);
     }
   }
 

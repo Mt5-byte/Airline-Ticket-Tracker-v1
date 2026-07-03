@@ -28,7 +28,7 @@ services:
     ports:
       - "3000:3000"
     command: >
-      sh -c "npx prisma db push --accept-data-loss --skip-generate && node server.js"
+      sh -c "npm run release && node server.js"
 
   worker:
     build: .

@@ -119,7 +119,8 @@ fly scale count web=1 worker=1
 
 The `fly.toml` declares two process groups — `web` and `worker` — so the
 per-minute loop runs in a dedicated machine and never competes with HTTP
-handlers.
+handlers. The release command (`npm run release`) syncs the schema and seeds
+the curated routes idempotently, so a fresh deploy boots with a live feed.
 
 ### Railway
 
@@ -133,13 +134,19 @@ Set the same env vars as above. Done.
 
 **Gotchas:**
 - After creating each service, open **Settings → Build** and confirm
-  **Builder = Dockerfile** (Railway's default is Nixpacks; the repo's
-  `railway.json` requests Dockerfile but the dashboard setting wins). If you
-  want to stay on Nixpacks, a fallback `nixpacks.toml` is included — it mirrors
-  the Dockerfile build.
-- The worker service must override its **Start Command** to
-  `npx tsx src/worker/index.ts` (the default start command comes from the
-  Dockerfile's `CMD`, which is the web server).
+  **Builder = Dockerfile** (Railway's default is Railpack; the repo's
+  `railway.json` requests Dockerfile but the dashboard setting can win). If
+  you stay on Railpack/Nixpacks, a fallback `nixpacks.toml` is included — it
+  mirrors the Dockerfile build.
+- `railway.json` deliberately sets **no start command and no healthcheck** —
+  Railway config-as-code applies to *every* service built from the repo, and a
+  web start command or HTTP healthcheck would silently break the worker
+  service (which runs no HTTP server). Configure per service in the dashboard:
+  - **web** — start command empty (the Dockerfile `CMD` runs the server);
+    healthcheck path `/api/health`.
+  - **worker** — start command `npx tsx src/worker/index.ts`; no healthcheck.
+- Run the one-time seed after the first deploy (`npm run release` in a
+  one-off shell, or let the worker create routes as users track them).
 - Set `NEXTAUTH_URL` and `APP_URL` to the public Railway URL **after** the
   first deploy gives you one, then redeploy once.
 
@@ -158,7 +165,9 @@ This brings up Postgres + web + worker with the schema migrated automatically.
 Skybird runs fine on Vercel for the web half; call the
 `POST /api/cron/tick?key=$CRON_SECRET` endpoint on a per-minute schedule from
 any external cron (Vercel Cron Jobs on Pro plan, Upstash QStash, GitHub
-Actions, etc.).
+Actions, etc.). The endpoint is POST-only and **requires** `CRON_SECRET` in
+production — it refuses to run unauthenticated rather than letting anyone
+burn your provider quota.
 
 ## Scripts
 

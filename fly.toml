@@ -8,7 +8,6 @@ primary_region = "iad"
 [env]
   NODE_ENV = "production"
   PORT = "3000"
-  WORKER_MODE = "standalone"
 
 [experimental]
   # Two independent processes: the Next.js server and the per-minute worker.
@@ -48,4 +47,7 @@ primary_region = "iad"
   processes = ["worker"]
 
 [deploy]
-  release_command = "npx prisma db push --accept-data-loss --skip-generate"
+  # Syncs schema (failing loudly on destructive drift — no --accept-data-loss)
+  # and seeds the curated routes idempotently, so a fresh deploy has a live
+  # feed instead of an empty database.
+  release_command = "npm run release"

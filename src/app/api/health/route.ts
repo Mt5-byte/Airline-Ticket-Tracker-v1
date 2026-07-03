@@ -18,8 +18,11 @@ export async function GET() {
       time: new Date().toISOString(),
     });
   } catch (e) {
+    // Log the real error server-side; never echo raw driver messages (which
+    // can include hostnames/DSN fragments) on a public endpoint.
+    console.error("[health] check failed:", e);
     return NextResponse.json(
-      { status: "error", message: (e as Error).message },
+      { status: "error", message: "database unreachable" },
       { status: 503 },
     );
   }

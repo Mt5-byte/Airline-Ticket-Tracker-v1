@@ -1,12 +1,19 @@
 import { createHash } from "crypto";
+import { Prisma } from "@prisma/client";
 import { prisma } from "./db";
 import { airportLabel, lookupAirport } from "./airports";
-import type { DealSignal, PriceQuote } from "./sources";
+import { hasRealProvider, type DealSignal, type PriceQuote } from "./sources";
 
 // A deal surfaces when the current price is materially below the route's
 // rolling 30-day median (default 20% for "notable", 30%+ for "significant").
 export const DEAL_THRESHOLD_PCT = 20;
 export const SIGNIFICANT_THRESHOLD_PCT = 30;
+
+// A route re-fires a baseline deal within this window only if the fare has
+// dropped materially deeper than the already-open deal. Prevents a fare that
+// jitters around a dip from minting a new deal (and emails) every poll.
+const REFIRE_WINDOW_MS = 12 * 3_600_000;
+const REFIRE_DEEPER_FACTOR = 0.95; // must be ≥5% cheaper than the open deal
 
 export type ScoredDeal = {
   origin: string;
@@ -27,37 +34,60 @@ export type ScoredDeal = {
   dedupeKey: string;
   expiresAt?: Date;
   routeId?: string;
+  userId?: string; // set for private user-target deals
 };
 
-function median(values: number[]): number | null {
-  if (!values.length) return null;
-  const sorted = [...values].sort((a, b) => a - b);
-  const mid = sorted.length >> 1;
-  return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+export type RouteBaseline = { median: number | null; samples: number };
+
+function dayBucket(): number {
+  return Math.floor(Date.now() / 86_400_000);
 }
 
-/** Pull 30d price history for a route. */
-async function routeBaseline(routeId: string): Promise<number | null> {
+/**
+ * Rolling 30-day median + sample count, computed in SQL so the worker never
+ * loads the raw per-minute sample rows into memory (43k rows/route/month).
+ * Demo-generated samples are excluded whenever a real provider is configured,
+ * so a transient real-provider outage can't poison the baseline.
+ */
+export async function routeBaseline(routeId: string): Promise<RouteBaseline> {
   const since = new Date(Date.now() - 30 * 86_400_000);
-  const rows = await prisma.priceSample.findMany({
-    where: { routeId, sampledAt: { gte: since } },
-    select: { priceCents: true },
-  });
-  return median(rows.map((r) => r.priceCents));
+  const demoFilter = hasRealProvider() ? Prisma.sql`AND "source" <> 'demo'` : Prisma.empty;
+  const rows = await prisma.$queryRaw<Array<{ median: number | null; n: number }>>`
+    SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY "priceCents") AS median,
+           count(*)::int AS n
+    FROM "PriceSample"
+    WHERE "routeId" = ${routeId} AND "sampledAt" >= ${since} ${demoFilter}
+  `;
+  const row = rows[0];
+  return { median: row?.median ?? null, samples: row?.n ?? 0 };
 }
 
 export async function evaluateQuote(
   routeId: string,
   quote: PriceQuote,
+  baseline: RouteBaseline,
 ): Promise<ScoredDeal | null> {
-  const baseline = await routeBaseline(routeId);
   // Need at least ~10 samples before trusting the baseline (~2 hours of polling).
-  const samples = await prisma.priceSample.count({ where: { routeId } });
-  if (!baseline || samples < 10) return null;
-  if (quote.priceCents >= baseline) return null;
+  if (!baseline.median || baseline.samples < 10) return null;
+  if (quote.priceCents >= baseline.median) return null;
 
-  const discountPct = ((baseline - quote.priceCents) / baseline) * 100;
+  const discountPct = ((baseline.median - quote.priceCents) / baseline.median) * 100;
   if (discountPct < DEAL_THRESHOLD_PCT) return null;
+
+  // Re-arm guard: if a baseline deal is already open for this route, only fire
+  // again when the fare has dropped materially below that deal's price.
+  const open = await prisma.deal.findFirst({
+    where: {
+      routeId,
+      source: "baseline",
+      seenAt: { gte: new Date(Date.now() - REFIRE_WINDOW_MS) },
+    },
+    orderBy: { seenAt: "desc" },
+    select: { priceCents: true },
+  });
+  if (open?.priceCents != null && quote.priceCents > open.priceCents * REFIRE_DEEPER_FACTOR) {
+    return null;
+  }
 
   // Score: saturating curve that values big drops heavily and decays modestly
   // by absolute price (a $50 drop on $200 matters more than on $2,000 in relative terms,
@@ -66,15 +96,17 @@ export async function evaluateQuote(
   const priceBonus = clamp(30 - quote.priceCents / 4000, 0, 30); // $0 → +30, $1200 → 0
   const score = Math.round(base + priceBonus);
 
+  // Key on route + UTC day + a $25 price band — NOT the raw cent price, which
+  // changes every poll and would re-fire (and re-email) once a minute.
   const dedupeKey = createHash("sha1")
-    .update(`baseline:${routeId}:${quote.priceCents}:${Math.floor(Date.now() / 3_600_000)}`)
+    .update(`baseline:${routeId}:${dayBucket()}:${Math.floor(quote.priceCents / 2500)}`)
     .digest("hex");
 
   return {
     origin: quote.origin,
     destination: quote.destination,
     priceCents: quote.priceCents,
-    baselineCents: baseline,
+    baselineCents: baseline.median,
     discountPct,
     score,
     cabin: quote.cabin,
@@ -86,6 +118,11 @@ export async function evaluateQuote(
     dedupeKey,
     routeId,
   };
+}
+
+function safeExternalUrl(url?: string): string | undefined {
+  if (!url) return undefined;
+  return /^https?:\/\//i.test(url) ? url : undefined;
 }
 
 export function evaluateSignal(signal: DealSignal): ScoredDeal {
@@ -104,7 +141,7 @@ export function evaluateSignal(signal: DealSignal): ScoredDeal {
     carrier: signal.carrier,
     source: signal.source === "twitter" ? "twitter" : "curated",
     sourceLabel: signal.sourceLabel,
-    sourceUrl: signal.sourceUrl,
+    sourceUrl: safeExternalUrl(signal.sourceUrl), // block javascript:/data: from feeds
     headline: signal.headline,
     body: signal.body,
     dedupeKey: signal.dedupeKey,
@@ -115,6 +152,7 @@ export function evaluateSignal(signal: DealSignal): ScoredDeal {
 export async function evaluateUserTarget(
   routeId: string,
   quote: PriceQuote,
+  baseline: RouteBaseline,
 ): Promise<ScoredDeal[]> {
   const trackers = await prisma.trackedRoute.findMany({
     where: {
@@ -126,7 +164,6 @@ export async function evaluateUserTarget(
     },
   });
   if (!trackers.length) return [];
-  const baseline = await routeBaseline(routeId);
   const results: ScoredDeal[] = [];
 
   for (const tr of trackers) {
@@ -136,23 +173,27 @@ export async function evaluateUserTarget(
       hit = true;
       reason = `Target $${(tr.targetCents / 100).toFixed(0)} hit`;
     }
-    if (!hit && tr.targetDropPct && baseline) {
-      const drop = ((baseline - quote.priceCents) / baseline) * 100;
+    if (!hit && tr.targetDropPct && baseline.median) {
+      const drop = ((baseline.median - quote.priceCents) / baseline.median) * 100;
       if (drop >= tr.targetDropPct) {
         hit = true;
         reason = `−${Math.round(drop)}% vs baseline`;
       }
     }
     if (!hit) continue;
+    // One target alert per tracker per UTC day. A fare hovering below the
+    // target must not email the user every minute.
     const dedupeKey = createHash("sha1")
-      .update(`user:${tr.id}:${quote.priceCents}:${Math.floor(Date.now() / 3_600_000)}`)
+      .update(`user:${tr.id}:${dayBucket()}`)
       .digest("hex");
     results.push({
       origin: quote.origin,
       destination: quote.destination,
       priceCents: quote.priceCents,
-      baselineCents: baseline ?? undefined,
-      discountPct: baseline ? ((baseline - quote.priceCents) / baseline) * 100 : undefined,
+      baselineCents: baseline.median ?? undefined,
+      discountPct: baseline.median
+        ? ((baseline.median - quote.priceCents) / baseline.median) * 100
+        : undefined,
       score: 95,
       cabin: quote.cabin,
       carrier: quote.carrier,
@@ -160,6 +201,7 @@ export async function evaluateUserTarget(
       sourceLabel: reason,
       dedupeKey,
       routeId,
+      userId: tr.userId,
       departAt: quote.departAt,
       returnAt: quote.returnAt,
     });
@@ -178,6 +220,7 @@ export async function persistDeal(d: ScoredDeal): Promise<{ created: boolean; id
   // tells us whether we inserted (1) or lost the race (0).
   const data = {
     routeId: d.routeId,
+    userId: d.userId,
     originCode: d.origin,
     destinationCode: d.destination,
     originName: origin ? `${origin.city}, ${origin.country}` : airportLabel(d.origin),

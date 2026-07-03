@@ -2,6 +2,7 @@ import Link from "next/link";
 import { getServerSession } from "next-auth";
 import { authOptions } from "@/lib/auth";
 import { LiveIndicator } from "./live-indicator";
+import { SignOutButton } from "./sign-out-button";
 import { Button } from "./ui/button";
 import { Plane } from "lucide-react";
 
@@ -40,9 +41,7 @@ export async function SiteHeader() {
         <div className="flex items-center gap-3">
           <LiveIndicator className="hidden sm:flex" />
           {signedIn ? (
-            <Button asChild variant="ghost" size="sm">
-              <Link href="/api/auth/signout?callbackUrl=/">Sign out</Link>
-            </Button>
+            <SignOutButton />
           ) : (
             <Button asChild size="sm">
               <Link href="/sign-in">Sign in</Link>
