@@ -70,7 +70,8 @@ Restart the worker and new deals will start flowing from the real APIs.
 ```
 ┌──────────────────────────────────────────────────────────────────┐
 │ worker (per-minute tick)                                         │
-│  ├─ fetchPriceQuote()  →  Duffel → Amadeus → demo fallback       │
+│  ├─ fetchPriceQuote()  →  Duffel → Amadeus (demo only when      │
+│  │                         no provider is configured)            │
 │  ├─ fetchDealSignals() →  curated RSS + X API v2                 │
 │  └─ deal-engine        →  baseline | curated | user-target       │
 │                             ↓                                    │
@@ -186,8 +187,10 @@ burn your provider quota.
 - **Rate limits.** With ~30 curated routes the worker makes ~30 provider calls
   per minute — well inside Duffel's and Amadeus's test-tier caps. Add more
   routes judiciously.
-- **Twitter/X.** Costs $200/mo minimum (Basic tier). If you skip it, the
-  curated RSS feeds still cover most public mistake-fare chatter.
+- **Twitter/X.** Costs $200/mo minimum (Basic tier). X is polled every 30
+  minutes by default (`X_POLL_MINUTES`) — per-minute polling would burn ~20×
+  the Basic tier's monthly read quota. If you skip it, the curated RSS feeds
+  still cover most public mistake-fare chatter.
 - **ToS.** Duffel and Amadeus are legit commercial APIs; scraping airline sites
   directly is not wired up on purpose.
 - **Standalone server + `.env`.** Next.js's standalone server (`node server.js`)

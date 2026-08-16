@@ -59,35 +59,43 @@ export async function POST(req: Request) {
     create: { origin, destination, isCurated: false },
   });
 
-  const existing = await prisma.trackedRoute.findUnique({
-    where: { userId_routeId: { userId, routeId: route.id } },
-  });
-  if (!existing) {
-    const count = await prisma.trackedRoute.count({ where: { userId } });
-    if (count >= MAX_TRACKED_ROUTES_PER_USER) {
-      return NextResponse.json(
-        { error: `route limit reached (${MAX_TRACKED_ROUTES_PER_USER})` },
-        { status: 400 },
-      );
+  // Cap check + upsert inside one transaction: a bare count-then-create lets
+  // concurrent POSTs race past the limit (TOCTOU).
+  const result = await prisma.$transaction(async (tx) => {
+    const existing = await tx.trackedRoute.findUnique({
+      where: { userId_routeId: { userId, routeId: route.id } },
+    });
+    if (!existing) {
+      const count = await tx.trackedRoute.count({ where: { userId } });
+      if (count >= MAX_TRACKED_ROUTES_PER_USER) {
+        return { limited: true as const };
+      }
     }
-  }
+    const tracked = await tx.trackedRoute.upsert({
+      where: { userId_routeId: { userId, routeId: route.id } },
+      // Only overwrite targets the caller actually sent — a re-POST without
+      // targets must not silently clear an existing target. (Clearing is done
+      // by removing and re-adding the route; the form says so.)
+      update: {
+        ...(parsed.data.targetCents !== undefined ? { targetCents: parsed.data.targetCents } : {}),
+        ...(parsed.data.targetDropPct !== undefined ? { targetDropPct: parsed.data.targetDropPct } : {}),
+      },
+      create: {
+        userId,
+        routeId: route.id,
+        targetCents: parsed.data.targetCents ?? null,
+        targetDropPct: parsed.data.targetDropPct ?? null,
+      },
+      include: { route: true },
+    });
+    return { limited: false as const, tracked };
+  }, { isolationLevel: "Serializable" });
 
-  const tracked = await prisma.trackedRoute.upsert({
-    where: { userId_routeId: { userId, routeId: route.id } },
-    // Only overwrite targets the caller actually sent — a re-POST without
-    // targets must not silently clear an existing target. (Clearing is done
-    // by removing and re-adding the route.)
-    update: {
-      ...(parsed.data.targetCents !== undefined ? { targetCents: parsed.data.targetCents } : {}),
-      ...(parsed.data.targetDropPct !== undefined ? { targetDropPct: parsed.data.targetDropPct } : {}),
-    },
-    create: {
-      userId,
-      routeId: route.id,
-      targetCents: parsed.data.targetCents ?? null,
-      targetDropPct: parsed.data.targetDropPct ?? null,
-    },
-    include: { route: true },
-  });
-  return NextResponse.json({ tracked });
+  if (result.limited) {
+    return NextResponse.json(
+      { error: `route limit reached (${MAX_TRACKED_ROUTES_PER_USER})` },
+      { status: 400 },
+    );
+  }
+  return NextResponse.json({ tracked: result.tracked });
 }

@@ -1,5 +1,6 @@
 import { prisma } from "@/lib/db";
 import { authOptions } from "@/lib/auth";
+import { hasRealProvider } from "@/lib/sources";
 import { NextResponse } from "next/server";
 import { getServerSession } from "next-auth";
 
@@ -11,7 +12,7 @@ const SOURCES = new Set(["baseline", "curated", "twitter", "user-target"]);
 function num(raw: string | null, fallback: number, lo: number, hi: number): number {
   const n = Number(raw ?? fallback);
   if (!Number.isFinite(n)) return fallback; // garbage input must not reach Prisma as NaN
-  return Math.min(hi, Math.max(lo, n));
+  return Math.floor(Math.min(hi, Math.max(lo, n)));
 }
 
 export async function GET(req: Request) {
@@ -28,8 +29,15 @@ export async function GET(req: Request) {
 
   const where: any = {
     score: { gte: minScore },
-    // Private user-target deals are visible only to their owner.
-    OR: [{ userId: null }, ...(userId ? [{ userId }] : [])],
+    AND: [
+      // Private user-target deals are visible only to their owner.
+      { OR: [{ userId: null }, ...(userId ? [{ userId }] : [])] },
+      // Expired deals drop out of the feed instead of lingering until the
+      // 60-day retention pass.
+      { OR: [{ expiresAt: null }, { expiresAt: { gt: new Date() } }] },
+      // Demo-era deals disappear once real providers are configured.
+      ...(hasRealProvider() ? [{ isDemo: false }] : []),
+    ],
   };
   if (source) where.source = source;
   if (origin) where.originCode = origin;

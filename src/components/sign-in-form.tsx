@@ -7,6 +7,16 @@ import { Input } from "@/components/ui/input";
 import { Plane, Mail, AlertTriangle } from "lucide-react";
 import { useSearchParams } from "next/navigation";
 
+// NextAuth redirects failed sign-ins back here with ?error= — swallowing it
+// leaves users staring at a blank form wondering why nothing happened.
+const AUTH_ERRORS: Record<string, string> = {
+  OAuthAccountNotLinked:
+    "That email is already registered with a different sign-in method — use the one you signed up with.",
+  EmailSignin: "Couldn't send the magic link. Check the address and try again.",
+  AccessDenied: "Sign-in was refused for this account.",
+  Verification: "That sign-in link has expired or was already used — request a new one.",
+};
+
 export function SignInForm({
   emailEnabled,
   googleEnabled,
@@ -16,6 +26,10 @@ export function SignInForm({
 }) {
   const sp = useSearchParams();
   const callbackUrl = sp.get("next") ?? "/routes";
+  const authError = sp.get("error");
+  const errorMessage = authError
+    ? AUTH_ERRORS[authError] ?? "Sign-in failed — please try again."
+    : null;
   const [email, setEmail] = useState("");
   const [pending, setPending] = useState(false);
 
@@ -37,6 +51,13 @@ export function SignInForm({
         <p className="mt-1 text-xs text-muted-foreground">
           Track your own routes and get email alerts when fares drop.
         </p>
+
+        {errorMessage && (
+          <div className="mt-6 flex items-start gap-2 rounded-md border border-destructive/30 bg-destructive/10 p-3 text-xs text-destructive">
+            <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+            <span>{errorMessage}</span>
+          </div>
+        )}
 
         {nothingConfigured && (
           <div className="mt-6 flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-400">

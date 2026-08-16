@@ -1,6 +1,8 @@
+import { Prisma } from "@prisma/client";
 import { getServerSession } from "next-auth";
 import { prisma } from "@/lib/db";
 import { authOptions } from "@/lib/auth";
+import { hasRealProvider } from "@/lib/sources";
 import { notFound } from "next/navigation";
 import { airportLabel, lookupAirport } from "@/lib/airports";
 import { formatPriceCents, timeAgo, formatDateRange } from "@/lib/format";
@@ -36,11 +38,13 @@ export default async function DealDetail({
   if (deal.routeId) {
     const since = new Date(Date.now() - 30 * 86_400_000);
     // Hourly-averaged in SQL — a 30-day window of raw per-minute samples is
-    // ~43k rows and must not be loaded into the page render.
+    // ~43k rows and must not be loaded into the page render. Demo-era samples
+    // are excluded once real providers exist (different price distribution).
+    const demoFilter = hasRealProvider() ? Prisma.sql`AND "source" <> 'demo'` : Prisma.empty;
     const rows = await prisma.$queryRaw<Array<{ h: Date; p: number }>>`
       SELECT date_trunc('hour', "sampledAt") AS h, AVG("priceCents")::float AS p
       FROM "PriceSample"
-      WHERE "routeId" = ${deal.routeId} AND "sampledAt" >= ${since}
+      WHERE "routeId" = ${deal.routeId} AND "sampledAt" >= ${since} ${demoFilter}
       GROUP BY 1
       ORDER BY 1 ASC
     `;
@@ -49,7 +53,11 @@ export default async function DealDetail({
       where: {
         routeId: deal.routeId,
         id: { not: deal.id },
-        OR: [{ userId: null }, ...(userId ? [{ userId }] : [])],
+        AND: [
+          { OR: [{ userId: null }, ...(userId ? [{ userId }] : [])] },
+          { OR: [{ expiresAt: null }, { expiresAt: { gt: new Date() } }] },
+          ...(hasRealProvider() ? [{ isDemo: false }] : []),
+        ],
       },
       orderBy: { seenAt: "desc" },
       take: 4,

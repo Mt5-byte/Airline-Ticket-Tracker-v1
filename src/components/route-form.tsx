@@ -156,7 +156,9 @@ export function RouteForm({ existing }: { existing: Tracked[] }) {
         </div>
         <div className="mt-4 flex items-center justify-between gap-3">
           <p className="text-xs text-muted-foreground">
-            Skybird will alert you the moment the price hits your target or drops below the rolling 30-day median.
+            Skybird will alert you the moment the price hits your target or drops below the rolling
+            30-day median. Re-adding a route with a blank field keeps its existing target — remove
+            the route to clear targets.
           </p>
           <Button type="submit" disabled={pending || !origin || !destination}>
             {pending ? "Adding…" : "Track route"} <ArrowRight className="h-4 w-4" />

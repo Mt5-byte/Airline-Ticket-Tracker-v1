@@ -109,6 +109,10 @@ model Deal {
   departAt        DateTime?
   returnAt        DateTime?
   source          String // "baseline" | "curated" | "user-target" | "twitter"
+  // True when the deal was minted from demo-generator data. Lets the re-arm
+  // guard and public feed exclude demo-era deals after real provider keys are
+  // configured (demo prices come from a different distribution).
+  isDemo          Boolean   @default(false)
   sourceLabel     String?
   sourceUrl       String?
   headline        String?

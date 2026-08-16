@@ -10,16 +10,13 @@ import {
 import { sendDealEmail } from "../lib/email";
 import { airportLabel, lookupAirport } from "../lib/airports";
 
-const TICK_BUDGET_MS = 55_000; // leave headroom within the 60s cadence
+const POLL_BUDGET_MS = 40_000; // route polling budget within the 60s cadence
+const SIGNALS_BUDGET_MS = 15_000; // signals get their own budget — a slow poll phase must not starve them
 const POLL_CONCURRENCY = 8; // don't burst every route at a rate-limited provider at once
 const SAMPLE_RETENTION_DAYS = 35;
 const DEAL_RETENTION_DAYS = 60;
-
-async function inBatches<T>(items: T[], size: number, fn: (item: T) => Promise<void>) {
-  for (let i = 0; i < items.length; i += size) {
-    await Promise.all(items.slice(i, i + size).map(fn));
-  }
-}
+const WORKER_RUN_RETENTION_DAYS = 7;
+const MAX_SIGNAL_AGE_DAYS = 30; // feed items older than this never become deals
 
 export async function runTick() {
   const run = await prisma.workerRun.create({ data: {} });
@@ -28,6 +25,7 @@ export async function runTick() {
   let dealsNew = 0;
   let errors = 0;
   let skipped = 0;
+  let unpolled = 0;
 
   try {
     const routes = await prisma.route.findMany({
@@ -36,66 +34,104 @@ export async function runTick() {
       },
     });
 
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), TICK_BUDGET_MS);
-
+    // 1) Poll prices for every active route, at bounded concurrency, stopping
+    // loudly when the budget lapses so tail-route starvation is visible in
+    // logs and WorkerRun instead of silently repeating every tick.
+    const pollController = new AbortController();
+    const pollTimeout = setTimeout(() => pollController.abort(), POLL_BUDGET_MS);
     try {
-      // 1) Poll prices for every active route, at bounded concurrency.
-      await inBatches(routes, POLL_CONCURRENCY, async (r) => {
-        try {
-          const quote = await fetchPriceQuote(r.origin, r.destination, controller.signal);
-          if (!quote) {
-            // Real provider configured but errored/rate-limited: skip the
-            // sample rather than record fabricated demo data (which would
-            // poison the route's baseline).
-            skipped++;
-            return;
-          }
-          await prisma.priceSample.create({
-            data: {
-              routeId: r.id,
-              priceCents: quote.priceCents,
-              currency: quote.currency,
-              cabin: quote.cabin,
-              carrier: quote.carrier,
-              source: quote.source,
-              departAt: quote.departAt,
-              returnAt: quote.returnAt,
-              deepLink: quote.deepLink,
-            },
-          });
-          sampled++;
-
-          // One baseline computation per route per tick (SQL median), shared
-          // by both the baseline evaluator and every user-target check.
-          const baseline = await routeBaseline(r.id);
-
-          const baselineDeal = await evaluateQuote(r.id, quote, baseline);
-          if (baselineDeal) {
-            const res = await persistDeal(baselineDeal);
-            if (res?.created) {
-              dealsNew++;
-              await notifyTrackers(r.id, res.id);
-            }
-          }
-          const userHits = await evaluateUserTarget(r.id, quote, baseline);
-          for (const u of userHits) {
-            const res = await persistDeal(u);
-            if (res?.created) {
-              dealsNew++;
-              await notifyTrackers(r.id, res.id);
-            }
-          }
-        } catch (e) {
-          errors++;
-          console.warn(`[tick] ${r.origin}->${r.destination}:`, (e as Error).message);
+      for (let i = 0; i < routes.length; i += POLL_CONCURRENCY) {
+        if (pollController.signal.aborted) {
+          unpolled = routes.length - i;
+          console.warn(
+            `[tick] poll budget (${POLL_BUDGET_MS}ms) exceeded — ${unpolled}/${routes.length} routes unpolled this tick`,
+          );
+          break;
         }
-      });
+        await Promise.all(
+          routes.slice(i, i + POLL_CONCURRENCY).map(async (r) => {
+            try {
+              const quote = await fetchPriceQuote(r.origin, r.destination, pollController.signal);
+              if (!quote) {
+                // Real provider configured but errored/rate-limited: skip the
+                // sample rather than record fabricated demo data (which would
+                // poison the route's baseline).
+                skipped++;
+                return;
+              }
+              await prisma.priceSample.create({
+                data: {
+                  routeId: r.id,
+                  priceCents: quote.priceCents,
+                  currency: quote.currency,
+                  cabin: quote.cabin,
+                  carrier: quote.carrier,
+                  source: quote.source,
+                  departAt: quote.departAt,
+                  returnAt: quote.returnAt,
+                  deepLink: quote.deepLink,
+                },
+              });
+              sampled++;
 
-      // 2) External deal signals (curated feeds + Twitter).
-      const signals = await fetchDealSignals(controller.signal);
+              // Deal evaluation is USD-only: the baseline median is a USD
+              // distribution, and comparing a GBP fare against it would mint
+              // bogus discounts. (The sample is still stored above.)
+              if (quote.currency !== "USD") return;
+
+              // One baseline computation per route per tick (SQL median), shared
+              // by both the baseline evaluator and every user-target check.
+              const baseline = await routeBaseline(r.id);
+
+              const baselineDeal = await evaluateQuote(r.id, quote, baseline);
+              if (baselineDeal) {
+                const res = await persistDeal(baselineDeal);
+                if (res) {
+                  if (res.created) dealsNew++;
+                  // Notify even when the row already existed: the Alert table
+                  // dedupes per (user, deal), so this retries transiently
+                  // failed sends instead of losing them forever.
+                  await notifyTrackers(r.id, res.id);
+                }
+              }
+              const userHits = await evaluateUserTarget(r.id, quote, baseline);
+              for (const u of userHits) {
+                const res = await persistDeal(u);
+                if (res) {
+                  if (res.created) dealsNew++;
+                  await notifyTrackers(r.id, res.id);
+                }
+              }
+            } catch (e) {
+              errors++;
+              console.warn(`[tick] ${r.origin}->${r.destination}:`, (e as Error).message);
+            }
+          }),
+        );
+      }
+    } finally {
+      clearTimeout(pollTimeout);
+    }
+
+    if (hasRealProvider() && routes.length > 0 && sampled === 0) {
+      console.warn(
+        "[tick] ALL real-provider polls failed — check provider credentials/quota (no demo fallback in provider mode)",
+      );
+    }
+
+    // 2) External deal signals (curated feeds + Twitter) — own budget, never
+    // starved by a slow poll phase.
+    const sigController = new AbortController();
+    const sigTimeout = setTimeout(() => sigController.abort(), SIGNALS_BUDGET_MS);
+    try {
+      const signals = await fetchDealSignals(sigController.signal);
+      const maxAgeMs = MAX_SIGNAL_AGE_DAYS * 86_400_000;
       for (const s of signals) {
         try {
+          // Stale feed items must not become "new" deals — and after the 60-day
+          // deal retention pass, a still-published old item would otherwise be
+          // re-minted and re-alerted.
+          if (s.seenAt && Date.now() - s.seenAt.getTime() > maxAgeMs) continue;
           // Adapters validate codes against the airport dictionary, so this
           // only creates real (non-polled, non-curated) routes for linking.
           if (!lookupAirport(s.origin) || !lookupAirport(s.destination)) continue;
@@ -108,33 +144,34 @@ export async function runTick() {
           const scored = evaluateSignal(s);
           scored.routeId = route.id;
           const res = await persistDeal(scored);
-          if (res?.created) {
-            dealsNew++;
+          if (res) {
+            if (res.created) dealsNew++;
             await notifyTrackers(route.id, res.id);
           }
         } catch {
           errors++;
         }
       }
-
-      // 3) Retention: once an hour, prune old samples and expired deals so the
-      // per-minute append never grows the tables (and the median scans)
-      // without bound.
-      if (new Date().getUTCMinutes() === 0) {
-        const sampleCutoff = new Date(Date.now() - SAMPLE_RETENTION_DAYS * 86_400_000);
-        const dealCutoff = new Date(Date.now() - DEAL_RETENTION_DAYS * 86_400_000);
-        const [prunedSamples, prunedDeals] = await Promise.all([
-          prisma.priceSample.deleteMany({ where: { sampledAt: { lt: sampleCutoff } } }),
-          prisma.deal.deleteMany({ where: { seenAt: { lt: dealCutoff } } }),
-        ]);
-        if (prunedSamples.count || prunedDeals.count) {
-          console.log(
-            `[tick] retention: pruned ${prunedSamples.count} samples, ${prunedDeals.count} deals`,
-          );
-        }
-      }
     } finally {
-      clearTimeout(timeout);
+      clearTimeout(sigTimeout);
+    }
+
+    // 3) Retention: once an hour, prune old samples, deals, and worker-run
+    // bookkeeping so per-minute appends never grow tables without bound.
+    if (new Date().getUTCMinutes() === 0) {
+      const sampleCutoff = new Date(Date.now() - SAMPLE_RETENTION_DAYS * 86_400_000);
+      const dealCutoff = new Date(Date.now() - DEAL_RETENTION_DAYS * 86_400_000);
+      const runCutoff = new Date(Date.now() - WORKER_RUN_RETENTION_DAYS * 86_400_000);
+      const [prunedSamples, prunedDeals, prunedRuns] = await Promise.all([
+        prisma.priceSample.deleteMany({ where: { sampledAt: { lt: sampleCutoff } } }),
+        prisma.deal.deleteMany({ where: { seenAt: { lt: dealCutoff } } }),
+        prisma.workerRun.deleteMany({ where: { startedAt: { lt: runCutoff } } }),
+      ]);
+      if (prunedSamples.count || prunedDeals.count || prunedRuns.count) {
+        console.log(
+          `[tick] retention: pruned ${prunedSamples.count} samples, ${prunedDeals.count} deals, ${prunedRuns.count} runs`,
+        );
+      }
     }
   } catch (e) {
     errors++;
@@ -149,13 +186,13 @@ export async function runTick() {
       sampled,
       dealsNew,
       errors,
-      note: summarize(sourcesStatus(), skipped),
+      note: summarize(sourcesStatus(), skipped, unpolled),
     },
   }).catch(() => {
     // Never let bookkeeping take down the tick.
   });
   console.log(
-    `[tick] sampled=${sampled} skipped=${skipped} newDeals=${dealsNew} errors=${errors} ${elapsed}ms`,
+    `[tick] sampled=${sampled} skipped=${skipped} unpolled=${unpolled} newDeals=${dealsNew} errors=${errors} ${elapsed}ms`,
   );
 }
 
@@ -203,7 +240,9 @@ async function notifyTrackers(routeId: string, dealId: string) {
   }
 }
 
-function summarize(s: ReturnType<typeof sourcesStatus>, skipped: number) {
-  const base = `duffel=${s.duffel ? "on" : "off"} amadeus=${s.amadeus ? "on" : "off"} twitter=${s.twitter ? "on" : "off"}${s.demoMode ? " (demo)" : ""}`;
-  return hasRealProvider() && skipped > 0 ? `${base} skipped=${skipped}` : base;
+function summarize(s: ReturnType<typeof sourcesStatus>, skipped: number, unpolled: number) {
+  let base = `duffel=${s.duffel ? "on" : "off"} amadeus=${s.amadeus ? "on" : "off"} twitter=${s.twitter ? "on" : "off"}${s.demoMode ? " (demo)" : ""}`;
+  if (skipped > 0) base += ` skipped=${skipped}`;
+  if (unpolled > 0) base += ` unpolled=${unpolled}`;
+  return base;
 }

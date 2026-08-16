@@ -9,6 +9,7 @@ type Filter = {
   label: string;
   value: string | null;
   icon: React.ComponentType<{ className?: string }>;
+  requiresAuth?: boolean;
 };
 
 const FILTERS: Filter[] = [
@@ -16,10 +17,12 @@ const FILTERS: Filter[] = [
   { label: "Mistake fares", value: "baseline", icon: TrendingDown },
   { label: "Curated", value: "curated", icon: Sparkles },
   { label: "Twitter", value: "twitter", icon: Twitter },
-  { label: "Your targets", value: "user-target", icon: Target },
+  // Target deals are private per-user — the filter is meaningless (always
+  // empty, with a misleading empty-state) for signed-out visitors.
+  { label: "Your targets", value: "user-target", icon: Target, requiresAuth: true },
 ];
 
-export function FilterBar() {
+export function FilterBar({ signedIn = false }: { signedIn?: boolean }) {
   const router = useRouter();
   const sp = useSearchParams();
   const [pending, start] = useTransition();
@@ -34,7 +37,7 @@ export function FilterBar() {
 
   return (
     <div className="flex flex-wrap items-center gap-1">
-      {FILTERS.map((f) => {
+      {FILTERS.filter((f) => !f.requiresAuth || signedIn).map((f) => {
         const is = active === f.value || (f.value === null && !active);
         return (
           <button

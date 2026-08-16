@@ -9,11 +9,18 @@ import { hasRealProvider, type DealSignal, type PriceQuote } from "./sources";
 export const DEAL_THRESHOLD_PCT = 20;
 export const SIGNIFICANT_THRESHOLD_PCT = 30;
 
-// A route re-fires a baseline deal within this window only if the fare has
-// dropped materially deeper than the already-open deal. Prevents a fare that
-// jitters around a dip from minting a new deal (and emails) every poll.
-const REFIRE_WINDOW_MS = 12 * 3_600_000;
-const REFIRE_DEEPER_FACTOR = 0.95; // must be ≥5% cheaper than the open deal
+// Re-fire semantics for an open baseline deal (all enforced by the re-arm
+// guard in evaluateQuote):
+//   - materially deeper (≥5% below the deepest open deal) → fire
+//   - fare recovered above ~15%-below-median since the open deal, then dipped
+//     again → a NEW dip event → fire
+//   - anything else (jitter, band edges, UTC-midnight rollover, worse price
+//     in the same dip) → suppress
+// The guard window must cover the full dedupe-key horizon (day bucket keeps a
+// key live up to 24h) with margin, or deals re-fire when the window lapses.
+const REFIRE_WINDOW_MS = 36 * 3_600_000;
+const REFIRE_DEEPER_FACTOR = 0.95;
+const RECOVERY_FRACTION = 1 - (DEAL_THRESHOLD_PCT - 5) / 100; // fare "recovered" above 85% of median
 
 export type ScoredDeal = {
   origin: string;
@@ -35,6 +42,8 @@ export type ScoredDeal = {
   expiresAt?: Date;
   routeId?: string;
   userId?: string; // set for private user-target deals
+  isDemo?: boolean; // minted from demo-generator data
+  seenAt?: Date; // original publication time for feed/tweet signals
 };
 
 export type RouteBaseline = { median: number | null; samples: number };
@@ -43,11 +52,19 @@ function dayBucket(): number {
   return Math.floor(Date.now() / 86_400_000);
 }
 
+// 5%-logarithmic price band: any ≥5% move lands in a different band, so the
+// dedupe key can never silently veto a re-fire the guard approved. (A fixed
+// $25 band blocked legitimate ≥5%-deeper re-fires on fares under ~$500.)
+function priceBand(priceCents: number): number {
+  return Math.round(Math.log(Math.max(1, priceCents)) / Math.log(1.05));
+}
+
 /**
  * Rolling 30-day median + sample count, computed in SQL so the worker never
- * loads the raw per-minute sample rows into memory (43k rows/route/month).
- * Demo-generated samples are excluded whenever a real provider is configured,
- * so a transient real-provider outage can't poison the baseline.
+ * loads raw per-minute rows into memory. USD-only (mixed currencies would
+ * poison the distribution) and demo samples are excluded whenever a real
+ * provider is configured. Median is rounded: percentile_cont interpolates
+ * between samples and a fractional value would crash Int-column writes.
  */
 export async function routeBaseline(routeId: string): Promise<RouteBaseline> {
   const since = new Date(Date.now() - 30 * 86_400_000);
@@ -56,10 +73,14 @@ export async function routeBaseline(routeId: string): Promise<RouteBaseline> {
     SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY "priceCents") AS median,
            count(*)::int AS n
     FROM "PriceSample"
-    WHERE "routeId" = ${routeId} AND "sampledAt" >= ${since} ${demoFilter}
+    WHERE "routeId" = ${routeId} AND "sampledAt" >= ${since}
+      AND "currency" = 'USD' ${demoFilter}
   `;
   const row = rows[0];
-  return { median: row?.median ?? null, samples: row?.n ?? 0 };
+  return {
+    median: row?.median != null ? Math.round(row.median) : null,
+    samples: row?.n ?? 0,
+  };
 }
 
 export async function evaluateQuote(
@@ -74,19 +95,34 @@ export async function evaluateQuote(
   const discountPct = ((baseline.median - quote.priceCents) / baseline.median) * 100;
   if (discountPct < DEAL_THRESHOLD_PCT) return null;
 
-  // Re-arm guard: if a baseline deal is already open for this route, only fire
-  // again when the fare has dropped materially below that deal's price.
-  const open = await prisma.deal.findFirst({
+  // Re-arm guard. Anchor on the DEEPEST open deal in the window (not the most
+  // recent — a shallow re-fire must not erase the guard's memory of a deeper
+  // price), and ignore demo-era deals once real providers are configured.
+  const windowStart = new Date(Date.now() - REFIRE_WINDOW_MS);
+  const anchor = await prisma.deal.findFirst({
     where: {
       routeId,
       source: "baseline",
-      seenAt: { gte: new Date(Date.now() - REFIRE_WINDOW_MS) },
+      seenAt: { gte: windowStart },
+      ...(hasRealProvider() ? { isDemo: false } : {}),
     },
-    orderBy: { seenAt: "desc" },
-    select: { priceCents: true },
+    orderBy: { priceCents: "asc" },
+    select: { priceCents: true, seenAt: true },
   });
-  if (open?.priceCents != null && quote.priceCents > open.priceCents * REFIRE_DEEPER_FACTOR) {
-    return null;
+  if (anchor?.priceCents != null && quote.priceCents > anchor.priceCents * REFIRE_DEEPER_FACTOR) {
+    // Not materially deeper than the open deal. Re-fire only if the fare
+    // recovered (dip ended) since that deal — i.e. this is a new dip event.
+    const recovered = await prisma.priceSample.findFirst({
+      where: {
+        routeId,
+        sampledAt: { gt: anchor.seenAt },
+        priceCents: { gte: Math.round(baseline.median * RECOVERY_FRACTION) },
+        currency: "USD",
+        ...(hasRealProvider() ? { source: { not: "demo" } } : {}),
+      },
+      select: { id: true },
+    });
+    if (!recovered) return null;
   }
 
   // Score: saturating curve that values big drops heavily and decays modestly
@@ -96,10 +132,8 @@ export async function evaluateQuote(
   const priceBonus = clamp(30 - quote.priceCents / 4000, 0, 30); // $0 → +30, $1200 → 0
   const score = Math.round(base + priceBonus);
 
-  // Key on route + UTC day + a $25 price band — NOT the raw cent price, which
-  // changes every poll and would re-fire (and re-email) once a minute.
   const dedupeKey = createHash("sha1")
-    .update(`baseline:${routeId}:${dayBucket()}:${Math.floor(quote.priceCents / 2500)}`)
+    .update(`baseline:${routeId}:${dayBucket()}:${priceBand(quote.priceCents)}`)
     .digest("hex");
 
   return {
@@ -117,6 +151,7 @@ export async function evaluateQuote(
     sourceLabel: `Baseline −${Math.round(discountPct)}%`,
     dedupeKey,
     routeId,
+    isDemo: quote.source === "demo",
   };
 }
 
@@ -145,6 +180,9 @@ export function evaluateSignal(signal: DealSignal): ScoredDeal {
     headline: signal.headline,
     body: signal.body,
     dedupeKey: signal.dedupeKey,
+    // Preserve the original publication time so old feed items don't surface
+    // as if they broke "just now".
+    seenAt: signal.seenAt,
     expiresAt: signal.expiresAt ?? new Date(Date.now() + 14 * 86_400_000),
   };
 }
@@ -173,7 +211,10 @@ export async function evaluateUserTarget(
       hit = true;
       reason = `Target $${(tr.targetCents / 100).toFixed(0)} hit`;
     }
-    if (!hit && tr.targetDropPct && baseline.median) {
+    // The drop-percentage branch needs the same minimum-sample gate as
+    // evaluateQuote: a "median" of 1-3 quotes is noise, and firing a score-95
+    // alert off it emails users about phantom drops on freshly added routes.
+    if (!hit && tr.targetDropPct && baseline.median && baseline.samples >= 10) {
       const drop = ((baseline.median - quote.priceCents) / baseline.median) * 100;
       if (drop >= tr.targetDropPct) {
         hit = true;
@@ -181,10 +222,12 @@ export async function evaluateUserTarget(
       }
     }
     if (!hit) continue;
-    // One target alert per tracker per UTC day. A fare hovering below the
-    // target must not email the user every minute.
+    // One alert per tracker per UTC day PER TARGET — the target values are in
+    // the key so a target edited mid-day re-arms immediately (otherwise a user
+    // who lowers their target after a morning alert silently misses the hit
+    // on the new target until midnight).
     const dedupeKey = createHash("sha1")
-      .update(`user:${tr.id}:${dayBucket()}`)
+      .update(`user:${tr.id}:${dayBucket()}:${tr.targetCents ?? ""}:${tr.targetDropPct ?? ""}`)
       .digest("hex");
     results.push({
       origin: quote.origin,
@@ -202,6 +245,7 @@ export async function evaluateUserTarget(
       dedupeKey,
       routeId,
       userId: tr.userId,
+      isDemo: quote.source === "demo",
       departAt: quote.departAt,
       returnAt: quote.returnAt,
     });
@@ -233,6 +277,7 @@ export async function persistDeal(d: ScoredDeal): Promise<{ created: boolean; id
     departAt: d.departAt,
     returnAt: d.returnAt,
     source: d.source,
+    isDemo: d.isDemo ?? false,
     sourceLabel: d.sourceLabel,
     sourceUrl: d.sourceUrl,
     headline: d.headline,
@@ -240,6 +285,7 @@ export async function persistDeal(d: ScoredDeal): Promise<{ created: boolean; id
     score: d.score,
     dedupeKey: d.dedupeKey,
     expiresAt: d.expiresAt,
+    ...(d.seenAt ? { seenAt: d.seenAt } : {}),
   };
   const result = await prisma.deal.createMany({ data: [data], skipDuplicates: true });
   const row = await prisma.deal.findUnique({

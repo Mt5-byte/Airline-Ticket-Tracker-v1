@@ -7,7 +7,7 @@ import { FilterBar } from "@/components/filter-bar";
 import { EmptyState } from "@/components/empty-state";
 import { Plane, Sparkles } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
-import { sourcesStatus } from "@/lib/sources";
+import { hasRealProvider, sourcesStatus } from "@/lib/sources";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -26,14 +26,18 @@ export default async function HomePage({ searchParams }: { searchParams: SearchP
   const session = await getServerSession(authOptions);
   const userId = (session?.user as { id?: string } | undefined)?.id;
 
-  const where: any = {
-    score: { gte: 50 },
+  const visibility: any[] = [
     // Private user-target deals appear only in their owner's feed.
-    OR: [{ userId: null }, ...(userId ? [{ userId }] : [])],
-  };
+    { OR: [{ userId: null }, ...(userId ? [{ userId }] : [])] },
+    // Expired deals drop out instead of lingering until retention.
+    { OR: [{ expiresAt: null }, { expiresAt: { gt: new Date() } }] },
+    // Demo-era deals disappear once real providers are configured.
+    ...(hasRealProvider() ? [{ isDemo: false }] : []),
+  ];
+  const where: any = { score: { gte: 50 }, AND: visibility };
   if (source) where.source = source;
 
-  const [deals, totalRoutes, totalDeals, lastRun] = await Promise.all([
+  const [deals, totalRoutes, totalDeals, bestDiscount, lastRun] = await Promise.all([
     prisma.deal.findMany({
       where,
       orderBy: [{ score: "desc" }, { seenAt: "desc" }],
@@ -41,6 +45,9 @@ export default async function HomePage({ searchParams }: { searchParams: SearchP
     }),
     prisma.route.count(),
     prisma.deal.count(),
+    // The hero stat previously showed the TOP-SCORED deal's discount, which is
+    // not the best discount (score also weighs absolute price).
+    prisma.deal.aggregate({ _max: { discountPct: true }, where: { AND: visibility } }),
     prisma.workerRun.findFirst({ orderBy: { startedAt: "desc" } }),
   ]);
 
@@ -52,10 +59,11 @@ export default async function HomePage({ searchParams }: { searchParams: SearchP
   const historyByRoute: Record<string, number[]> = {};
   if (routeIds.length) {
     const since = new Date(Date.now() - 14 * 86_400_000);
+    const demoFilter = hasRealProvider() ? Prisma.sql`AND "source" <> 'demo'` : Prisma.empty;
     const rows = await prisma.$queryRaw<Array<{ routeId: string; h: Date; p: number }>>`
       SELECT "routeId", date_trunc('hour', "sampledAt") AS h, AVG("priceCents")::float AS p
       FROM "PriceSample"
-      WHERE "routeId" IN (${Prisma.join(routeIds)}) AND "sampledAt" >= ${since}
+      WHERE "routeId" IN (${Prisma.join(routeIds)}) AND "sampledAt" >= ${since} ${demoFilter}
       GROUP BY 1, 2
       ORDER BY 2 ASC
     `;
@@ -65,7 +73,6 @@ export default async function HomePage({ searchParams }: { searchParams: SearchP
   }
 
   const status = sourcesStatus();
-  const biggest = deals[0];
 
   return (
     <div className="container pt-10 pb-20">
@@ -89,7 +96,11 @@ export default async function HomePage({ searchParams }: { searchParams: SearchP
           <Stat label="Deals found" value={totalDeals.toLocaleString()} />
           <Stat
             label="Best discount"
-            value={biggest?.discountPct ? `−${Math.round(biggest.discountPct)}%` : "—"}
+            value={
+              bestDiscount._max.discountPct
+                ? `−${Math.round(bestDiscount._max.discountPct)}%`
+                : "—"
+            }
           />
           <Stat
             label="Last check"
@@ -106,7 +117,7 @@ export default async function HomePage({ searchParams }: { searchParams: SearchP
             {status.demoMode && " Currently running in demo mode — configure Duffel or Amadeus keys for real data."}
           </p>
         </div>
-        <FilterBar />
+        <FilterBar signedIn={Boolean(userId)} />
       </section>
 
       <section className="mt-5 grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3">

@@ -4,6 +4,12 @@ import { extractPriceCents, extractRoute } from "./extract";
 
 const DEFAULT_ACCOUNTS = "SecretFlying,TheFlightDeal,airfarewatchdog,going,Scottscheapflt";
 
+// Per-minute polling of 5 accounts would burn ~216k reads/month — 20x over
+// the X API Basic tier (10k/mo), going dark for most of each month. Default
+// to one poll per 30 minutes (~7.2k/mo), tunable via X_POLL_MINUTES.
+const DEFAULT_POLL_MINUTES = 30;
+let lastPollAt = 0;
+
 type CachedUser = { id: string; username: string };
 let userCache: CachedUser[] | null = null;
 let lastFetch = 0;
@@ -38,6 +44,9 @@ async function getUserIds(
 export async function fetchXDeals(signal?: AbortSignal): Promise<DealSignal[]> {
   const token = process.env.X_BEARER_TOKEN;
   if (!token) return [];
+  const pollMinutes = Number(process.env.X_POLL_MINUTES) || DEFAULT_POLL_MINUTES;
+  if (Date.now() - lastPollAt < pollMinutes * 60_000) return [];
+  lastPollAt = Date.now(); // set before fetching so errors don't cause hammering
   const accountsEnv = (process.env.X_DEAL_ACCOUNTS || DEFAULT_ACCOUNTS)
     .split(",")
     .map((s) => s.trim())
@@ -48,8 +57,8 @@ export async function fetchXDeals(signal?: AbortSignal): Promise<DealSignal[]> {
   if (!users.length) return [];
 
   const out: DealSignal[] = [];
-  // Poll per-user recent tweets. At 5 accounts this is ~5 req/min — well within
-  // the Basic tier (10K reads/mo) for a single-instance deployment.
+  // Poll per-user recent tweets. With the 30-minute gate above, 5 accounts
+  // cost ~7.2k reads/month — inside the Basic tier's 10k/mo.
   await Promise.all(
     users.map(async (u) => {
       const params = new URLSearchParams({

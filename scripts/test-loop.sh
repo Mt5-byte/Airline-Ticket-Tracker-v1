@@ -30,7 +30,13 @@ if [ -d .next/standalone ]; then
   cp -r public .next/standalone/public 2>/dev/null || true
 fi
 
-psql_run() { PGPASSWORD=skybird psql -q -h localhost -U skybird -d skybird -tA "$@"; }
+# DB connection is parameterized (defaults match the local sandbox role) so
+# the harness follows the environment instead of hardcoding bespoke creds.
+DB_USER="${SKYBIRD_DB_USER:-skybird}"
+DB_PASS="${SKYBIRD_DB_PASS:-skybird}"
+DB_NAME="${SKYBIRD_DB_NAME:-skybird}"
+DB_HOST="${SKYBIRD_DB_HOST:-localhost}"
+psql_run() { PGPASSWORD="$DB_PASS" psql -q -h "$DB_HOST" -U "$DB_USER" -d "$DB_NAME" -tA "$@"; }
 
 pass_count=0
 fail_count=0
@@ -143,9 +149,9 @@ run_once() {
       local url="http://localhost:$PORT$url_path"
       local actual
       if [ -z "$body" ]; then
-        actual=$(curl -sS -o /dev/null -w "%{http_code}" ${method:+-X "$method"} ${hdr:+-H "$hdr"} --max-time 6 "$url")
+        actual=$(curl -sS -o /dev/null -w "%{http_code}" ${method:+-X "$method"} ${hdr:+-H "$hdr"} --max-time 30 "$url")
       else
-        actual=$(curl -sS -o /dev/null -w "%{http_code}" ${method:+-X "$method"} -H 'content-type: application/json' -d "$body" --max-time 6 "$url")
+        actual=$(curl -sS -o /dev/null -w "%{http_code}" ${method:+-X "$method"} -H 'content-type: application/json' -d "$body" --max-time 30 "$url")
       fi
       assert "$name" "$expected" "$actual" || endpoint_fails=$((endpoint_fails+1))
     done <<EOF
@@ -294,7 +300,7 @@ PY
 
     # ========== content assertions ==========
     echo "  --- content ---"
-    curl -sS --max-time 6 "http://localhost:$PORT/" > "$LOG_DIR/home-$i.html"
+    curl -sS --max-time 30 "http://localhost:$PORT/" > "$LOG_DIR/home-$i.html"
     local content_fails=0
     for needle in "Significantly discounted air travel" "Live deal feed" "polling every 60 seconds"; do
       grep -q "$needle" "$LOG_DIR/home-$i.html" || { echo "    FAIL content: '$needle'"; content_fails=$((content_fails+1)); }

@@ -29,7 +29,9 @@ if (process.env.EMAIL_SERVER_HOST) {
             }
           : undefined,
       },
-      from: process.env.EMAIL_FROM ?? "Skybird <alerts@example.com>",
+      // Same default as alert emails (src/lib/email.ts) — a mismatched
+      // example.com sender here would fail DMARC and silently kill magic links.
+      from: process.env.EMAIL_FROM ?? "Skybird <alerts@skybird.app>",
     }),
   );
 }
