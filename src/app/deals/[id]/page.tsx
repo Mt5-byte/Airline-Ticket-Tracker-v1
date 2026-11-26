@@ -32,6 +32,10 @@ export default async function DealDetail({
   const userId = (session?.user as { id?: string } | undefined)?.id;
   // Private user-target deals exist only for their owner.
   if (deal.userId && deal.userId !== userId) return notFound();
+  // Demo-era deals are fabricated data once real providers exist — the feed,
+  // related list, and API all hide them, and the canonical URL (still live in
+  // old alert emails and shared links) must not present them as real either.
+  if (deal.isDemo && hasRealProvider()) return notFound();
 
   let history: number[] = [];
   let related: Deal[] = [];

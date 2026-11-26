@@ -42,6 +42,11 @@ export const authOptions: NextAuthOptions = {
   pages: {
     signIn: "/sign-in",
     verifyRequest: "/sign-in/check-email",
+    // Error-page codes (Verification = expired/used magic link — the single
+    // most common failure in a magic-link app — plus AccessDenied and
+    // Configuration) otherwise land on NextAuth's unstyled default page;
+    // the sign-in form already maps them from ?error=.
+    error: "/sign-in",
   },
   session: { strategy: "database" },
   callbacks: {

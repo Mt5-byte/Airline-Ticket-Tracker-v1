@@ -3,6 +3,7 @@ import { authOptions } from "@/lib/auth";
 import { isValidIata } from "@/lib/airports";
 import { NextResponse } from "next/server";
 import { getServerSession } from "next-auth";
+import { Prisma } from "@prisma/client";
 import { z } from "zod";
 
 export const runtime = "nodejs";
@@ -61,35 +62,56 @@ export async function POST(req: Request) {
 
   // Cap check + upsert inside one transaction: a bare count-then-create lets
   // concurrent POSTs race past the limit (TOCTOU).
-  const result = await prisma.$transaction(async (tx) => {
-    const existing = await tx.trackedRoute.findUnique({
-      where: { userId_routeId: { userId, routeId: route.id } },
-    });
-    if (!existing) {
-      const count = await tx.trackedRoute.count({ where: { userId } });
-      if (count >= MAX_TRACKED_ROUTES_PER_USER) {
-        return { limited: true as const };
+  const runTx = () =>
+    prisma.$transaction(async (tx) => {
+      const existing = await tx.trackedRoute.findUnique({
+        where: { userId_routeId: { userId, routeId: route.id } },
+      });
+      if (!existing) {
+        const count = await tx.trackedRoute.count({ where: { userId } });
+        if (count >= MAX_TRACKED_ROUTES_PER_USER) {
+          return { limited: true as const };
+        }
       }
+      const tracked = await tx.trackedRoute.upsert({
+        where: { userId_routeId: { userId, routeId: route.id } },
+        // Only overwrite targets the caller actually sent — a re-POST without
+        // targets must not silently clear an existing target. (Clearing is done
+        // by removing and re-adding the route; the form says so.)
+        update: {
+          ...(parsed.data.targetCents !== undefined ? { targetCents: parsed.data.targetCents } : {}),
+          ...(parsed.data.targetDropPct !== undefined ? { targetDropPct: parsed.data.targetDropPct } : {}),
+        },
+        create: {
+          userId,
+          routeId: route.id,
+          targetCents: parsed.data.targetCents ?? null,
+          targetDropPct: parsed.data.targetDropPct ?? null,
+        },
+        include: { route: true },
+      });
+      return { limited: false as const, tracked };
+    }, { isolationLevel: "Serializable" });
+
+  // Serializable transactions abort with 40001 under concurrency (two tabs, a
+  // double-submit, even two different routes for the same user — the count()
+  // predicate overlaps). Prisma surfaces that as P2034 and documents it as
+  // retry-at-caller; the upsert's SELECT-then-INSERT can also lose a same-key
+  // race as P2002, which turns into an update on re-run. Both are transient,
+  // so retry instead of surfacing a 500 for an operation that would succeed.
+  let result: Awaited<ReturnType<typeof runTx>> | null = null;
+  for (let attempt = 1; attempt <= 3 && result === null; attempt++) {
+    try {
+      result = await runTx();
+    } catch (e) {
+      const code = e instanceof Prisma.PrismaClientKnownRequestError ? e.code : null;
+      if ((code !== "P2034" && code !== "P2002") || attempt === 3) throw e;
+      await new Promise((r) => setTimeout(r, 25 * attempt + Math.random() * 50));
     }
-    const tracked = await tx.trackedRoute.upsert({
-      where: { userId_routeId: { userId, routeId: route.id } },
-      // Only overwrite targets the caller actually sent — a re-POST without
-      // targets must not silently clear an existing target. (Clearing is done
-      // by removing and re-adding the route; the form says so.)
-      update: {
-        ...(parsed.data.targetCents !== undefined ? { targetCents: parsed.data.targetCents } : {}),
-        ...(parsed.data.targetDropPct !== undefined ? { targetDropPct: parsed.data.targetDropPct } : {}),
-      },
-      create: {
-        userId,
-        routeId: route.id,
-        targetCents: parsed.data.targetCents ?? null,
-        targetDropPct: parsed.data.targetDropPct ?? null,
-      },
-      include: { route: true },
-    });
-    return { limited: false as const, tracked };
-  }, { isolationLevel: "Serializable" });
+  }
+  if (result === null) {
+    return NextResponse.json({ error: "conflict — please retry" }, { status: 409 });
+  }
 
   if (result.limited) {
     return NextResponse.json(

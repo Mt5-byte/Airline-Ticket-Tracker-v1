@@ -128,7 +128,7 @@ the curated routes idempotently, so a fresh deploy boots with a live feed.
 Push this repo to GitHub, create a Railway project, add a Postgres plugin,
 then **two** services from the same repo:
 
-- **web** — Start command `node server.js` (uses the Dockerfile)
+- **web** — start command empty (the Dockerfile `CMD` runs the server)
 - **worker** — Start command `npx tsx src/worker/index.ts`
 
 Set the same env vars as above. Done.
@@ -146,8 +146,13 @@ Set the same env vars as above. Done.
   - **web** — start command empty (the Dockerfile `CMD` runs the server);
     healthcheck path `/api/health`.
   - **worker** — start command `npx tsx src/worker/index.ts`; no healthcheck.
-- Run the one-time seed after the first deploy (`npm run release` in a
-  one-off shell, or let the worker create routes as users track them).
+- Set the **web** service's **pre-deploy command** to `npm run release`
+  (Settings → Deploy). Unlike Fly (whose `fly.toml` declares a
+  `release_command`), Railway runs no schema sync on its own — without this,
+  any deploy that changes the Prisma schema (e.g. a new `Deal` column) breaks
+  every query against the old database until someone runs the sync by hand.
+  The command is idempotent: it pushes the schema and re-seeds the curated
+  routes on every deploy.
 - Set `NEXTAUTH_URL` and `APP_URL` to the public Railway URL **after** the
   first deploy gives you one, then redeploy once.
 
@@ -180,7 +185,7 @@ burn your provider quota.
 | `npm run worker`     | Per-minute tick scheduler (long-running)       |
 | `npm run worker:once`| Single tick — for external cron invocations    |
 | `npm run seed`       | Seed ~30 curated top routes                    |
-| `npm run prisma:migrate` | `prisma migrate deploy` (production)       |
+| `npm run release`    | Sync schema (`prisma db push`) + idempotent seed — run on every deploy |
 
 ## Notes
 

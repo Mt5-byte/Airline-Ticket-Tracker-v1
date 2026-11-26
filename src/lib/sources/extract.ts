@@ -41,11 +41,17 @@ export function extractRoute(text: string): { origin?: string; destination?: str
     seen.push(m);
   }
   if (toCode) {
-    const origin = seen.find((c) => c !== toCode);
+    // Only trust an origin that appears BEFORE the "to ..." phrase — a code
+    // after it is usually a second destination option or a bystander mention
+    // ("to Rome FCO or Milan MXP" must not fabricate MXP→FCO).
+    const toIdx = toM?.index ?? 0;
+    const origin = seen.find((c) => c !== toCode && text.indexOf(c) < toIdx);
     return origin ? { origin, destination: toCode } : {};
   }
   if (fromCode) {
-    const destination = seen.find((c) => c !== fromCode);
+    // Mirror image: a destination must appear AFTER the "from ..." phrase.
+    const fromIdx = fromM?.index ?? 0;
+    const destination = seen.find((c) => c !== fromCode && text.indexOf(c) > fromIdx);
     return destination ? { origin: fromCode, destination } : {};
   }
   if (seen.length >= 2) return { origin: seen[0], destination: seen[1] };
@@ -68,11 +74,24 @@ export function extractPriceCents(text: string): number | undefined {
   for (const m of text.matchAll(/\$\s?(\d{1,3}(?:,\d{3})+|\d{2,5})(?!\d)/g)) {
     const dollars = parseInt(m[1].replace(/,/g, ""), 10);
     if (!Number.isFinite(dollars) || dollars < 80 || dollars > 20000) continue;
-    const before = text.slice(Math.max(0, (m.index ?? 0) - 12), m.index ?? 0);
-    const keyworded = /(from|for|only|at|just|now)\s*$/i.test(before);
-    candidates.push({ dollars, keyworded });
+    // The keyword must start a word: without the boundary, "seat $800",
+    // "Great $1,500" and "that $1,100" keyword-qualified via their 'at'
+    // tails and beat the real fare. When the lookback window is truncated
+    // mid-word its first characters can't be trusted as a word start, so ^
+    // only counts when the window really begins at the text start.
+    const start = Math.max(0, (m.index ?? 0) - 14);
+    const before = text.slice(start, m.index ?? 0);
+    const kw = start === 0
+      ? /(?:^|\s)(from|for|only|at|just|now)\s*$/i
+      : /\s(from|for|only|at|just|now)\s*$/i;
+    candidates.push({ dollars, keyworded: kw.test(before) });
   }
   if (!candidates.length) return undefined;
-  const pick = candidates.find((c) => c.keyworded) ?? candidates.reduce((a, b) => (a.dollars <= b.dollars ? a : b));
+  // Among keyworded candidates prefer the LOWEST (a promo amount that still
+  // sneaks a keyword must not beat a cheaper genuine fare), falling back to
+  // the lowest candidate overall.
+  const keyworded = candidates.filter((c) => c.keyworded);
+  const pool = keyworded.length ? keyworded : candidates;
+  const pick = pool.reduce((a, b) => (a.dollars <= b.dollars ? a : b));
   return pick.dollars * 100;
 }

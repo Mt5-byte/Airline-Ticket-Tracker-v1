@@ -11,14 +11,18 @@ export const SIGNIFICANT_THRESHOLD_PCT = 30;
 
 // Re-fire semantics for an open baseline deal (all enforced by the re-arm
 // guard in evaluateQuote):
-//   - materially deeper (≥5% below the deepest open deal) → fire
-//   - fare recovered above ~15%-below-median since the open deal, then dipped
-//     again → a NEW dip event → fire
+//   - materially deeper (≥5% below the most recent open deal) → fire
+//   - fare recovered above ~15%-below-baseline since the most recent open
+//     deal, then dipped again → a NEW dip event → fire
 //   - anything else (jitter, band edges, UTC-midnight rollover, worse price
 //     in the same dip) → suppress
-// The guard window must cover the full dedupe-key horizon (day bucket keeps a
-// key live up to 24h) with margin, or deals re-fire when the window lapses.
-const REFIRE_WINDOW_MS = 36 * 3_600_000;
+// The guard anchors on the MOST RECENT open deal: within one dip, deals only
+// fire ≥5%-deeper, so the latest IS the dip's deepest — and after a recovery
+// re-fire it marks the new dip's start, so old recovery samples (which sit
+// before it) can never re-arm the guard again. The window covers the full
+// default deal lifetime: a shorter window re-mints and re-emails an unchanged
+// multi-day dip every time it lapses.
+const REFIRE_WINDOW_MS = 14 * 86_400_000;
 const REFIRE_DEEPER_FACTOR = 0.95;
 const RECOVERY_FRACTION = 1 - (DEAL_THRESHOLD_PCT - 5) / 100; // fare "recovered" above 85% of median
 
@@ -68,7 +72,13 @@ function priceBand(priceCents: number): number {
  */
 export async function routeBaseline(routeId: string): Promise<RouteBaseline> {
   const since = new Date(Date.now() - 30 * 86_400_000);
-  const demoFilter = hasRealProvider() ? Prisma.sql`AND "source" <> 'demo'` : Prisma.empty;
+  // Symmetric provenance filter: provider mode excludes demo-generator
+  // samples, demo mode excludes real-era samples. (An asymmetric filter let
+  // real samples poison the demo baseline — and demo-era deals anchor real
+  // evaluations — whenever provider keys were added or removed mid-life.)
+  const demoFilter = hasRealProvider()
+    ? Prisma.sql`AND "source" <> 'demo'`
+    : Prisma.sql`AND "source" = 'demo'`;
   const rows = await prisma.$queryRaw<Array<{ median: number | null; n: number }>>`
     SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY "priceCents") AS median,
            count(*)::int AS n
@@ -95,34 +105,47 @@ export async function evaluateQuote(
   const discountPct = ((baseline.median - quote.priceCents) / baseline.median) * 100;
   if (discountPct < DEAL_THRESHOLD_PCT) return null;
 
-  // Re-arm guard. Anchor on the DEEPEST open deal in the window (not the most
-  // recent — a shallow re-fire must not erase the guard's memory of a deeper
-  // price), and ignore demo-era deals once real providers are configured.
+  // Re-arm guard. Anchor on the MOST RECENT open deal in the window: within a
+  // continuous dip every fired deal is ≥5% deeper than the last, so the most
+  // recent is also the dip's deepest — and a recovery re-fire resets it to the
+  // new dip's start, so a recovery event from an EARLIER dip can never keep
+  // re-arming later evaluations. Demo and real deals never anchor each other.
   const windowStart = new Date(Date.now() - REFIRE_WINDOW_MS);
   const anchor = await prisma.deal.findFirst({
     where: {
       routeId,
       source: "baseline",
       seenAt: { gte: windowStart },
-      ...(hasRealProvider() ? { isDemo: false } : {}),
+      isDemo: !hasRealProvider(),
     },
-    orderBy: { priceCents: "asc" },
-    select: { priceCents: true, seenAt: true },
+    orderBy: { seenAt: "desc" },
+    select: { priceCents: true, seenAt: true, baselineCents: true },
   });
+  let dipMarker = "";
   if (anchor?.priceCents != null && quote.priceCents > anchor.priceCents * REFIRE_DEEPER_FACTOR) {
     // Not materially deeper than the open deal. Re-fire only if the fare
     // recovered (dip ended) since that deal — i.e. this is a new dip event.
+    // Recovery is measured against the baseline THE ANCHOR FIRED ON: the
+    // rolling median drifts (sharply on young routes, where intra-dip samples
+    // dominate it), and a drifted bar turns dip samples into false
+    // "recoveries" or masks real ones.
+    const recoveryRef = anchor.baselineCents ?? baseline.median;
     const recovered = await prisma.priceSample.findFirst({
       where: {
         routeId,
         sampledAt: { gt: anchor.seenAt },
-        priceCents: { gte: Math.round(baseline.median * RECOVERY_FRACTION) },
+        priceCents: { gte: Math.round(recoveryRef * RECOVERY_FRACTION) },
         currency: "USD",
-        ...(hasRealProvider() ? { source: { not: "demo" } } : {}),
+        source: hasRealProvider() ? { not: "demo" } : "demo",
       },
-      select: { id: true },
+      orderBy: { sampledAt: "desc" },
+      select: { sampledAt: true },
     });
     if (!recovered) return null;
+    // A recovery re-fire can land in the same UTC day AND the same 5% price
+    // band as the previous dip's deal — tag the key with the dip generation
+    // so the dedupe key cannot silently veto a re-fire the guard approved.
+    dipMarker = `:r${Math.floor(recovered.sampledAt.getTime() / 3_600_000)}`;
   }
 
   // Score: saturating curve that values big drops heavily and decays modestly
@@ -132,8 +155,13 @@ export async function evaluateQuote(
   const priceBonus = clamp(30 - quote.priceCents / 4000, 0, 30); // $0 → +30, $1200 → 0
   const score = Math.round(base + priceBonus);
 
+  // Mode token: a provider-mode deal must never collide with a demo-era row
+  // sharing route/day/band — the demo row is hidden from every feed in
+  // provider mode, so the collision would mint nothing visible while still
+  // emailing trackers a link to the hidden fabricated deal.
+  const mode = quote.source === "demo" ? "demo" : "live";
   const dedupeKey = createHash("sha1")
-    .update(`baseline:${routeId}:${dayBucket()}:${priceBand(quote.priceCents)}`)
+    .update(`baseline:${mode}:${routeId}:${dayBucket()}:${priceBand(quote.priceCents)}${dipMarker}`)
     .digest("hex");
 
   return {
@@ -225,9 +253,11 @@ export async function evaluateUserTarget(
     // One alert per tracker per UTC day PER TARGET — the target values are in
     // the key so a target edited mid-day re-arms immediately (otherwise a user
     // who lowers their target after a morning alert silently misses the hit
-    // on the new target until midnight).
+    // on the new target until midnight). The demo/live mode token keeps a
+    // demo-era hit from suppressing the first real hit on cutover day.
+    const mode = quote.source === "demo" ? "demo" : "live";
     const dedupeKey = createHash("sha1")
-      .update(`user:${tr.id}:${dayBucket()}:${tr.targetCents ?? ""}:${tr.targetDropPct ?? ""}`)
+      .update(`user:${mode}:${tr.id}:${dayBucket()}:${tr.targetCents ?? ""}:${tr.targetDropPct ?? ""}`)
       .digest("hex");
     results.push({
       origin: quote.origin,

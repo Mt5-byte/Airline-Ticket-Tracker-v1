@@ -44,10 +44,12 @@ export default async function HomePage({ searchParams }: { searchParams: SearchP
       take: 60,
     }),
     prisma.route.count(),
-    prisma.deal.count(),
-    // The hero stat previously showed the TOP-SCORED deal's discount, which is
-    // not the best discount (score also weighs absolute price).
-    prisma.deal.aggregate({ _max: { discountPct: true }, where: { AND: visibility } }),
+    // Hero stats share the FEED's population. An unfiltered count() counted
+    // other users' private target deals, expired deals, and hidden demo-era
+    // rows; an aggregate without the score floor advertised discounts no
+    // visible card carried.
+    prisma.deal.count({ where: { AND: visibility } }),
+    prisma.deal.aggregate({ _max: { discountPct: true }, where }),
     prisma.workerRun.findFirst({ orderBy: { startedAt: "desc" } }),
   ]);
 

@@ -15,6 +15,7 @@ const AUTH_ERRORS: Record<string, string> = {
   EmailSignin: "Couldn't send the magic link. Check the address and try again.",
   AccessDenied: "Sign-in was refused for this account.",
   Verification: "That sign-in link has expired or was already used — request a new one.",
+  Configuration: "Sign-in is misconfigured on the server — please try again later.",
 };
 
 export function SignInForm({

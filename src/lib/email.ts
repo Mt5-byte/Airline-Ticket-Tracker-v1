@@ -16,6 +16,11 @@ type DealEmailPayload = {
 
 let transporterCache: nodemailer.Transporter | null = null;
 
+// Lets callers skip whole notification fan-outs when no send can succeed.
+export function emailConfigured(): boolean {
+  return Boolean(process.env.EMAIL_SERVER_HOST);
+}
+
 // Headline/source strings originate from external RSS feeds and tweets —
 // escape everything interpolated into the HTML body or a malicious feed item
 // could inject markup into alert emails.

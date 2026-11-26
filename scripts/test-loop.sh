@@ -30,13 +30,12 @@ if [ -d .next/standalone ]; then
   cp -r public .next/standalone/public 2>/dev/null || true
 fi
 
-# DB connection is parameterized (defaults match the local sandbox role) so
-# the harness follows the environment instead of hardcoding bespoke creds.
-DB_USER="${SKYBIRD_DB_USER:-skybird}"
-DB_PASS="${SKYBIRD_DB_PASS:-skybird}"
-DB_NAME="${SKYBIRD_DB_NAME:-skybird}"
-DB_HOST="${SKYBIRD_DB_HOST:-localhost}"
-psql_run() { PGPASSWORD="$DB_PASS" psql -q -h "$DB_HOST" -U "$DB_USER" -d "$DB_NAME" -tA "$@"; }
+# psql connects with the SAME DATABASE_URL the server/worker/seed use — a
+# second set of DB vars once let the harness reset one database while the app
+# ran against another, producing a wall of misleading assertion failures.
+# (psql rejects Prisma-specific URI params like ?schema=, so strip the query.)
+PSQL_URL="${DATABASE_URL%%\?*}"
+psql_run() { psql -q "$PSQL_URL" -tA "$@"; }
 
 pass_count=0
 fail_count=0
